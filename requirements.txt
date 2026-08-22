@@ -1,0 +1,16 @@
+torch>=2.1
+transformers>=4.40
+peft>=0.10
+accelerate>=0.28
+datasets>=2.18
+evaluate>=0.4
+bitsandbytes>=0.43
+scikit-learn>=1.4
+pandas>=2.0
+numpy>=1.26
+matplotlib>=3.8
+pyyaml>=6.0
+tensorboard>=2.14
+jupyter>=1.0
+scipy>=1.12
+pytest>=8.0

@@ -1,0 +1,84 @@
+# Google Colab GPU configuration (T4, 16 GB VRAM)
+# Auto-selected when running inside a Colab notebook.
+
+project:
+  name: abpsees
+  seed: 42
+
+paths:
+  data_dir: data/synthetic
+  processed_dir: data/processed
+  output_dir: outputs
+  checkpoint_dir: outputs/checkpoints
+  tensorboard_dir: outputs/tensorboard
+  reports_dir: outputs/reports
+
+model:
+  name: Qwen/Qwen2.5-3B-Instruct
+  max_seq_length: 2048
+  trust_remote_code: false
+
+lora:
+  r: 16
+  lora_alpha: 32
+  dropout: 0.05
+  bias: none
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+quantization:
+  load_in_4bit: true
+  bnb_4bit_compute_dtype: float16
+  bnb_4bit_quant_type: nf4
+  use_double_quant: true
+
+training:
+  num_epochs: 3
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 4
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  lr_scheduler_type: cosine
+  max_grad_norm: 1.0
+  gradient_checkpointing: true
+  fp16: true
+  bf16: false
+  eval_steps: 25
+  save_steps: 25
+  logging_steps: 10
+  save_total_limit: 2
+  early_stopping_patience: 3
+  load_best_model_at_end: true
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+
+data:
+  file_pattern: "*.json"
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  evidence_on_invalid: discard
+  normalize_unicode: true
+  synthetic_num_samples: 200
+
+inference:
+  max_new_tokens: 512
+  temperature: 0.1
+  do_sample: false
+  faithfulness_warn: true
+
+colab:
+  enabled: true
+  project_dir: /content/ABPSEES
+  mount_google_drive: false
+  drive_project_path: /content/drive/MyDrive/ABPSEES
+  hf_token_env: HF_TOKEN
+  use_colab_secrets: true
