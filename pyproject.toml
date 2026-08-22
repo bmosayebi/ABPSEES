@@ -26,9 +26,13 @@ dependencies = [
     "bitsandbytes>=0.43",
 ]
 
+[tool.setuptools]
+package-dir = {"" = "."}
+
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["project*"]
+include = ["project"]
+namespaces = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

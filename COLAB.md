@@ -64,11 +64,37 @@ drive.mount('/content/drive')
 
 ## قدم ۳ — نصب وابستگی‌ها
 
+> ⚠️ **مهم:** از `%pip` استفاده کن (نه `!pip`) و نصب را در **سل جدا** از import انجام بده.
+
+**سل ۱ — Clone و نصب:**
+
 ```python
+# اگر قبلاً clone کرده‌ای، پاک کن:
+!rm -rf /content/ABPSEES
+
+!git clone https://github.com/bmosayebi/ABPSEES.git /content/ABPSEES
 %cd /content/ABPSEES
-!pip install -q -r requirements.txt
-!pip install -q -e .
+
+# %pip همان Python کرنل Colab را هدف می‌گیرد
+%pip install -q -r requirements.txt
+%pip install -q -e .
 ```
+
+**سل ۲ — Bootstrap و import:**
+
+```python
+exec(open("/content/ABPSEES/colab_bootstrap.py").read())
+ROOT = setup_colab_path()
+print("Project root:", ROOT)
+
+from project.config import load_config
+from project.utils import setup_colab_environment
+
+config = load_config()
+setup_colab_environment("HF_TOKEN")
+```
+
+اگر `import project` باز هم خطا داد، **Runtime → Restart session** بزن و فقط **سل ۲** را دوباره اجرا کن (نیازی به clone مجدد نیست).
 
 ---
 
@@ -85,14 +111,14 @@ drive.mount('/content/drive')
 ### تست توکن
 
 ```python
-import sys
-sys.path.insert(0, "/content/ABPSEES")
+exec(open("/content/ABPSEES/colab_bootstrap.py").read())
+setup_colab_path()
 
 from project.config import load_config, is_colab
 from project.utils import setup_colab_environment, get_device_config
 
 config = load_config()
-setup_colab_environment(config.colab.hf_token_env)
+setup_colab_environment("HF_TOKEN")
 
 print("Colab:", is_colab())
 print("GPU:", get_device_config(require_cuda=True).device)
@@ -162,9 +188,8 @@ paths:
 ### سل راه‌اندازی مشترک (در ابتدای هر نوت‌بوک)
 
 ```python
-import sys, os
-sys.path.insert(0, "/content/ABPSEES")
-os.environ["ABPSEES_ROOT"] = "/content/ABPSEES"
+exec(open("/content/ABPSEES/colab_bootstrap.py").read())
+ROOT = setup_colab_path()
 
 from project.config import load_config, is_colab
 from project.utils import setup_logging, setup_colab_environment
@@ -281,16 +306,21 @@ trainer = train_model(
 
 ---
 
-## خلاصه سریع (یک سل)
+## خلاصه سریع (دو سل)
 
+**سل ۱ — نصب:**
 ```python
-!git clone https://github.com/YOUR_USERNAME/ABPSEES.git /content/ABPSEES
+!rm -rf /content/ABPSEES
+!git clone https://github.com/bmosayebi/ABPSEES.git /content/ABPSEES
 %cd /content/ABPSEES
-!pip install -q -r requirements.txt -e .
+%pip install -q -r requirements.txt
+%pip install -q -e .
+```
 
-import sys, os
-sys.path.insert(0, "/content/ABPSEES")
-os.environ["ABPSEES_ROOT"] = "/content/ABPSEES"
+**سل ۲ — آموزش:**
+```python
+exec(open("/content/ABPSEES/colab_bootstrap.py").read())
+setup_colab_path()
 
 from project.config import load_config
 from project.utils import setup_colab_environment
