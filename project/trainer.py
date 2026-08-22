@@ -11,6 +11,7 @@ from transformers import EarlyStoppingCallback, Trainer, TrainingArguments
 
 from project.config import AppConfig, is_colab
 from project.dataset import load_split
+from project.hf_compat import compat_training_kwargs
 from project.model import get_model_and_tokenizer
 from project.preprocessing import (
     CompletionOnlyCollator,
@@ -27,6 +28,54 @@ from project.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def build_training_arguments(
+    config: AppConfig,
+    device_cfg: DeviceConfig,
+    output_dir: Path | None = None,
+) -> TrainingArguments:
+    """Create HuggingFace TrainingArguments from config."""
+    train_cfg = config.training
+    out = output_dir or config.paths.checkpoint_dir
+
+    use_fp16 = train_cfg.fp16 and device_cfg.device == "cuda"
+    use_bf16 = train_cfg.bf16 and device_cfg.device == "cuda"
+
+    kwargs = compat_training_kwargs(
+        {
+            "output_dir": str(out),
+            "num_train_epochs": train_cfg.num_epochs,
+            "per_device_train_batch_size": train_cfg.per_device_train_batch_size,
+            "per_device_eval_batch_size": train_cfg.per_device_eval_batch_size,
+            "gradient_accumulation_steps": train_cfg.gradient_accumulation_steps,
+            "learning_rate": train_cfg.learning_rate,
+            "weight_decay": train_cfg.weight_decay,
+            "warmup_ratio": train_cfg.warmup_ratio,
+            "lr_scheduler_type": train_cfg.lr_scheduler_type,
+            "max_grad_norm": train_cfg.max_grad_norm,
+            "fp16": use_fp16,
+            "bf16": use_bf16,
+            "eval_strategy": "steps",
+            "eval_steps": train_cfg.eval_steps,
+            "save_strategy": "steps",
+            "save_steps": train_cfg.save_steps,
+            "logging_steps": train_cfg.logging_steps,
+            "save_total_limit": train_cfg.save_total_limit,
+            "load_best_model_at_end": train_cfg.load_best_model_at_end,
+            "metric_for_best_model": train_cfg.metric_for_best_model,
+            "greater_is_better": train_cfg.greater_is_better,
+            "report_to": ["tensorboard"],
+            "logging_dir": str(config.paths.tensorboard_dir),
+            "gradient_checkpointing": train_cfg.gradient_checkpointing,
+            "gradient_checkpointing_kwargs": {"use_reentrant": False},
+            "remove_unused_columns": False,
+            "dataloader_pin_memory": True,
+            "dataloader_num_workers": 2,
+        },
+        TrainingArguments,
+    )
+    return TrainingArguments(**kwargs)
 
 
 def _prepare_enriched_splits(config: AppConfig, tokenizer: Any) -> dict[str, list[dict[str, Any]]]:
@@ -67,50 +116,6 @@ def build_tokenized_dataset(
         batched=False,
     )
     return tokenized
-
-
-def build_training_arguments(
-    config: AppConfig,
-    device_cfg: DeviceConfig,
-    output_dir: Path | None = None,
-) -> TrainingArguments:
-    """Create HuggingFace TrainingArguments from config."""
-    train_cfg = config.training
-    out = output_dir or config.paths.checkpoint_dir
-
-    use_fp16 = train_cfg.fp16 and device_cfg.device == "cuda"
-    use_bf16 = train_cfg.bf16 and device_cfg.device == "cuda"
-
-    return TrainingArguments(
-        output_dir=str(out),
-        num_train_epochs=train_cfg.num_epochs,
-        per_device_train_batch_size=train_cfg.per_device_train_batch_size,
-        per_device_eval_batch_size=train_cfg.per_device_eval_batch_size,
-        gradient_accumulation_steps=train_cfg.gradient_accumulation_steps,
-        learning_rate=train_cfg.learning_rate,
-        weight_decay=train_cfg.weight_decay,
-        warmup_ratio=train_cfg.warmup_ratio,
-        lr_scheduler_type=train_cfg.lr_scheduler_type,
-        max_grad_norm=train_cfg.max_grad_norm,
-        fp16=use_fp16,
-        bf16=use_bf16,
-        eval_strategy="steps",
-        eval_steps=train_cfg.eval_steps,
-        save_strategy="steps",
-        save_steps=train_cfg.save_steps,
-        logging_steps=train_cfg.logging_steps,
-        save_total_limit=train_cfg.save_total_limit,
-        load_best_model_at_end=train_cfg.load_best_model_at_end,
-        metric_for_best_model=train_cfg.metric_for_best_model,
-        greater_is_better=train_cfg.greater_is_better,
-        report_to=["tensorboard"],
-        logging_dir=str(config.paths.tensorboard_dir),
-        gradient_checkpointing=train_cfg.gradient_checkpointing,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-        remove_unused_columns=False,
-        dataloader_pin_memory=True,
-        dataloader_num_workers=2,
-    )
 
 
 def build_trainer(

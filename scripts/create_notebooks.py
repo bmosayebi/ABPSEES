@@ -38,20 +38,9 @@ def code(source: str) -> dict:
     }
 
 
-COLAB_SETUP = """import os
-import sys
-from pathlib import Path
-
-# Colab: project lives at /content/ABPSEES
-if Path('/content/ABPSEES/project').exists():
-    ROOT = Path('/content/ABPSEES')
-else:
-    ROOT = Path.cwd()
-    if not (ROOT / 'project').exists():
-        ROOT = ROOT.parent
-
-sys.path.insert(0, str(ROOT))
-os.environ['ABPSEES_ROOT'] = str(ROOT)
+COLAB_SETUP = """# Bootstrap path (required before import project)
+exec(open("/content/ABPSEES/colab_bootstrap.py").read())
+ROOT = setup_colab_path()
 
 %load_ext autoreload
 %autoreload 2
@@ -60,7 +49,7 @@ from project.config import load_config, is_colab
 from project.utils import setup_logging, setup_colab_environment
 
 setup_logging()
-config = load_config()  # auto-selects colab.yaml on Colab
+config = load_config()
 setup_colab_environment(
     hf_token_env=config.colab.hf_token_env,
     use_colab_secrets=config.colab.use_colab_secrets,
@@ -83,11 +72,12 @@ def write_notebooks(root: Path) -> None:
                 "and add `HF_TOKEN` in Secrets (🔑)."
             ),
             code(
-                """# Run once on Colab
-import os
-if os.path.exists('/content'):
-    get_ipython().system('pip install -q -r /content/ABPSEES/requirements.txt')
-    get_ipython().system('pip install -q -e /content/ABPSEES')
+                """# SEL 1 — Run once: clone + install (use %pip, not !pip)
+# !rm -rf /content/ABPSEES
+# !git clone https://github.com/bmosayebi/ABPSEES.git /content/ABPSEES
+# %cd /content/ABPSEES
+# %pip install -q -r requirements.txt
+# %pip install -q -e .
 """
             ),
             code(COLAB_SETUP),
