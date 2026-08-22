@@ -70,8 +70,8 @@ def build_training_arguments(
             "gradient_checkpointing": train_cfg.gradient_checkpointing,
             "gradient_checkpointing_kwargs": {"use_reentrant": False},
             "remove_unused_columns": False,
-            "dataloader_pin_memory": True,
-            "dataloader_num_workers": 2,
+            "dataloader_pin_memory": device_cfg.device == "cuda",
+            "dataloader_num_workers": 0,
         },
         TrainingArguments,
     )

@@ -232,7 +232,7 @@ def build_sft_dataset(
 
 
 class CompletionOnlyCollator:
-    """Data collator that masks prompt tokens for causal LM training."""
+    """Data collator that pads batches and masks prompt tokens for causal LM training."""
 
     def __init__(self, tokenizer: Any, response_template: str) -> None:
         """Initialize collator with tokenizer and response marker.
@@ -243,30 +243,54 @@ class CompletionOnlyCollator:
         """
         self.tokenizer = tokenizer
         self.response_template = response_template
+        self.pad_token_id = tokenizer.pad_token_id
         self.response_token_ids = tokenizer.encode(
             response_template, add_special_tokens=False
         )
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
-        """Collate batch and mask labels before the response template.
+        """Pad, collate, and mask labels before the assistant response template.
 
         Args:
             features: List of feature dicts with ``input_ids`` and ``labels``.
 
         Returns:
-            Batched tensors.
+            Batched tensors with dynamic padding per batch.
         """
         import torch
-        from transformers import default_data_collator
 
-        batch = default_data_collator(features)
-        labels = batch["labels"].clone()
-        for idx in range(labels.size(0)):
+        if not features:
+            raise ValueError("Cannot collate an empty feature list")
+
+        max_len = max(len(feature["input_ids"]) for feature in features)
+        input_ids_batch: list[list[int]] = []
+        attention_mask_batch: list[list[int]] = []
+        labels_batch: list[list[int]] = []
+
+        for feature in features:
+            input_ids = list(feature["input_ids"])
+            labels = list(feature.get("labels", input_ids))
+            attention_mask = list(
+                feature.get("attention_mask", [1] * len(input_ids))
+            )
+            pad_len = max_len - len(input_ids)
+
+            input_ids_batch.append(input_ids + [self.pad_token_id] * pad_len)
+            attention_mask_batch.append(attention_mask + [0] * pad_len)
+            labels_batch.append(labels + [-100] * pad_len)
+
+        batch = {
+            "input_ids": torch.tensor(input_ids_batch, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask_batch, dtype=torch.long),
+            "labels": torch.tensor(labels_batch, dtype=torch.long),
+        }
+
+        for idx in range(batch["labels"].size(0)):
             input_ids = batch["input_ids"][idx].tolist()
             resp_start = self._find_response_start(input_ids)
             if resp_start is not None:
-                labels[idx, :resp_start] = -100
-        batch["labels"] = labels
+                batch["labels"][idx, :resp_start] = -100
+
         return batch
 
     def _find_response_start(self, input_ids: list[int]) -> int | None:
