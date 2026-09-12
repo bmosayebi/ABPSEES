@@ -409,6 +409,7 @@ print(pretty_print_prediction(result))
 | session قطع شد | `model_bundle.zip` یا checkpoint‌ها را روی Drive ذخیره کن؛ با `resume_from_checkpoint` ادامه بده |
 | `model_bundle.zip` پیدا نشد | اول `train_model(config)` را تمام کن؛ فایل در `outputs/model_bundle.zip` است |
 | inference لوکال خیلی کند / RAM کم | مدل ۳B روی CPU سنگین است؛ GPU محلی یا همان Colab را برای inference استفاده کن |
+| `NameError: name '__file__' is not defined` | `colab_bootstrap.py` را آپدیت کن (یا دوباره `git clone` / `git pull` بزن) سپس سل bootstrap را دوباره اجرا کن |
 | `bitsandbytes` error | `!pip install -q bitsandbytes` را دوباره اجرا کن |
 
 ### ادامه آموزش از checkpoint

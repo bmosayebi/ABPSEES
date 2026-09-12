@@ -14,7 +14,11 @@ from pathlib import Path
 
 
 def _find_project_root() -> Path:
-    """Locate the ABPSEES repository root on Colab or locally."""
+    """Locate the ABPSEES repository root on Colab or locally.
+
+    Note: when this file is loaded via ``exec(open(...).read())`` in a Colab
+    cell, ``__file__`` is *not* defined — so we never rely on it alone.
+    """
     env_root = os.environ.get("ABPSEES_ROOT")
     if env_root:
         candidate = Path(env_root)
@@ -24,8 +28,11 @@ def _find_project_root() -> Path:
     candidates = [
         Path("/content/ABPSEES"),
         Path.cwd(),
-        Path(__file__).resolve().parent,
     ]
+    # Only available when the module is imported normally (not via exec()).
+    if "__file__" in globals():
+        candidates.append(Path(__file__).resolve().parent)
+
     for candidate in candidates:
         if (candidate / "project" / "__init__.py").exists():
             return candidate.resolve()
