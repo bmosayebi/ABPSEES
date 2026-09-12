@@ -454,9 +454,12 @@ print(diag["per_aspect"])
 
 ---
 
-## خلاصه سریع (دو سل)
+## خلاصه سریع — همهٔ سل‌های Colab (از صفر تا ذخیره مدل)
 
-**سل ۱ — نصب:**
+> قبل از اجرا: **Runtime → T4 GPU** و Secret **`HF_TOKEN`** را تنظیم کن.
+
+**سل ۱ — Clone و نصب وابستگی‌ها**
+
 ```python
 !rm -rf /content/ABPSEES
 !git clone https://github.com/bmosayebi/ABPSEES.git /content/ABPSEES
@@ -465,27 +468,66 @@ print(diag["per_aspect"])
 %pip install -q -e .
 ```
 
-**سل ۲ — آموزش:**
+**سل ۲ — Bootstrap، config، HuggingFace**
+
 ```python
 exec(open("/content/ABPSEES/colab_bootstrap.py").read())
-setup_colab_path()
+ROOT = setup_colab_path()
 
-from project.config import load_config
-from project.utils import setup_colab_environment
-from project.trainer import train_model
+from project.config import load_config, is_colab
+from project.utils import setup_logging, setup_colab_environment, get_device_config
 
+setup_logging()
 config = load_config()
-setup_colab_environment("HF_TOKEN")
-train_model(config)
-# بعد از آموزش: outputs/model_bundle.zip ساخته می‌شود و دانلود مرورگر شروع می‌شود.
+setup_colab_environment(
+    hf_token_env=config.colab.hf_token_env,
+    use_colab_secrets=config.colab.use_colab_secrets,
+    mount_google_drive=config.colab.mount_google_drive,
+)
+
+print("Root:", ROOT)
+print("Colab:", is_colab())
+print("GPU:", get_device_config(require_cuda=True).device)
 ```
 
-> قبل از اجرا: GPU را فعال کن و Secret `HF_TOKEN` را اضافه کن.
+**سل ۳ — آموزش مدل**
 
-بعد از دانلود zip، روی لپ‌تاپ:
+```python
+from project.trainer import train_model
+
+trainer = train_model(config)
+
+# خروجی‌های خودکار بعد از آموزش:
+#   /content/ABPSEES/outputs/checkpoints/best/   ← LoRA + aspect heads
+#   /content/ABPSEES/outputs/model_bundle.zip    ← یک فایل قابل دانلود
+print("Adapter:", config.paths.checkpoint_dir / "best")
+print("Bundle: ", config.paths.output_dir / "model_bundle.zip")
+```
+
+**سل ۴ — ذخیره مدل در آدرس مشخص (دانلود + Drive)**
+
+```python
+from pathlib import Path
+from google.colab import files, drive
+import shutil
+
+BUNDLE = Path("/content/ABPSEES/outputs/model_bundle.zip")
+assert BUNDLE.exists(), "اول سل ۳ (train_model) را کامل اجرا کن."
+
+# A) دانلود مستقیم روی لپ‌تاپ
+files.download(str(BUNDLE))
+
+# B) کپی روی Google Drive (مسیر دائمی)
+drive.mount("/content/drive")
+DRIVE_DIR = Path("/content/drive/MyDrive/ABPSEES")
+DRIVE_DIR.mkdir(parents=True, exist_ok=True)
+shutil.copy(BUNDLE, DRIVE_DIR / "model_bundle.zip")
+print("Saved to:", DRIVE_DIR / "model_bundle.zip")
+```
+
+بعد از دانلود، روی لپ‌تاپ:
 
 ```bash
-python3 scripts/run_bundle_inference.py \
-  --bundle outputs/model_bundle.zip \
-  --text "متن فارسی کاربر..."
+cd /Users/webravo/Desktop/ABPSEES
+python3 run_local.py outputs/model_bundle.zip "متن فارسی کاربر..."
 ```
