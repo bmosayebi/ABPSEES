@@ -52,6 +52,15 @@ generative JSON pipeline. See **[docs/ASPECT_ATTENTION_GUIDE.md](docs/ASPECT_ATT
 for the full scientific write-up, from problem formulation to end-to-end
 implementation.
 
+After Colab training, the adapter is packed into a single
+`outputs/model_bundle.zip`. Download that file and run it locally:
+
+```bash
+python3 run_local.py outputs/model_bundle.zip "متن فارسی کاربر..."
+```
+
+See **[COLAB.md](COLAB.md)** for the download + local-inference steps.
+
 ## License
 
 MIT

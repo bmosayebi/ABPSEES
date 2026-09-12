@@ -192,10 +192,22 @@ print('Train:', len(trainer.train_dataset), '| Val:', len(trainer.eval_dataset))
 """
             ),
             code(
-                """# Save outputs to Google Drive (optional):
+                """# After train_model() the single-file bundle is at:
+#   outputs/model_bundle.zip
+# Colab also starts a browser download automatically.
+# Re-download or copy to Drive if the browser prompt was dismissed:
+from pathlib import Path
+from google.colab import files
+
+bundle = Path('outputs/model_bundle.zip')
+print('Bundle exists:', bundle.exists(), bundle)
+if bundle.exists():
+    files.download(str(bundle))
+
+# Optional — keep a copy on Google Drive:
 # from google.colab import drive
 # drive.mount('/content/drive')
-# !cp -r outputs /content/drive/MyDrive/ABPSEES/
+# !cp outputs/model_bundle.zip /content/drive/MyDrive/ABPSEES/
 """
             ),
         ],

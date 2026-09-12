@@ -211,17 +211,62 @@ from project.trainer import train_model
 
 trainer = train_model(config)
 print("Done! Adapter saved to:", config.paths.checkpoint_dir / "best")
+print("Single-file bundle:", config.paths.output_dir / "model_bundle.zip")
 ```
 
 **زمان تقریبی:** ۳۰–۹۰ دقیقه (بسته به تعداد epoch و اندازه داده)
 
+بعد از اتمام آموزش، پروژه **خودکار** این‌ها را می‌سازد:
+
+| خروجی | مسیر |
+|--------|------|
+| پوشه LoRA adapter (+ هدهای aspect) | `outputs/checkpoints/best/` |
+| **یک فایل قابل دانلود** | `outputs/model_bundle.zip` |
+
+روی Colab، دانلود مرورگر برای `model_bundle.zip` هم خودکار شروع می‌شود. اگر پنجره دانلود را ندیدی، قدم ۸ را اجرا کن.
+
+این فایل zip فقط adapter کوچک LoRA و (در صورت فعال بودن) `aspect_heads.pt` را دارد، نه وزن‌های چندگیگابایتی Qwen. مدل پایه موقع inference از HuggingFace دوباره لود می‌شود.
+
 ---
 
-## قدم ۸ — ذخیره خروجی‌ها
+## قدم ۸ — دانلود مدل از Colab
 
-⚠️ **فایل‌های `/content/` بعد از بستن session پاک می‌شوند.**
+⚠️ **فایل‌های `/content/` بعد از بستن session پاک می‌شوند.** حتماً `model_bundle.zip` را دانلود کن یا روی Drive کپی کن.
 
-### روش A — دانلود مستقیم
+### روش A — دانلود همان یک فایل (پیشنهادی)
+
+```python
+from pathlib import Path
+from google.colab import files
+
+bundle = Path("/content/ABPSEES/outputs/model_bundle.zip")
+assert bundle.exists(), "train_model() را اول اجرا کن تا bundle ساخته شود."
+print("Bundle size (MB):", round(bundle.stat().st_size / 1e6, 1))
+files.download(str(bundle))
+```
+
+فایل را جایی روی لپ‌تاپ نگه دار، مثلاً:
+
+```
+/Users/webravo/Desktop/ABPSEES/outputs/model_bundle.zip
+```
+
+### روش B — کپی روی Google Drive
+
+```python
+from google.colab import drive
+from pathlib import Path
+
+drive.mount("/content/drive")
+dest = Path("/content/drive/MyDrive/ABPSEES")
+dest.mkdir(parents=True, exist_ok=True)
+!cp /content/ABPSEES/outputs/model_bundle.zip /content/drive/MyDrive/ABPSEES/
+print("Copied to", dest / "model_bundle.zip")
+```
+
+### روش C — آرشیو همهٔ خروجی‌ها (گزارش‌ها + checkpoint)
+
+اگر علاوه بر مدل، گزارش ارزیابی و TensorBoard را هم می‌خواهی:
 
 ```python
 from google.colab import files
@@ -231,19 +276,101 @@ shutil.make_archive("/content/abpsees_outputs", "zip", "/content/ABPSEES/outputs
 files.download("/content/abpsees_outputs.zip")
 ```
 
-### روش B — Google Drive
+---
+
+## اجرای مدل دانلودشده روی لپ‌تاپ
+
+بعد از دانلود `model_bundle.zip`، روی همین ماشین (بدون Colab) مدل را لود کن، متن فارسی بده و JSON خروجی را ببین.
+
+### پیش‌نیاز لوکال
+
+1. کلون همین ریپو و نصب وابستگی‌ها (یک‌بار):
+
+```bash
+cd /Users/webravo/Desktop/ABPSEES
+python3 -m pip install -r requirements.txt
+python3 -m pip install -e .
+```
+
+2. توکن HuggingFace را در محیط ست کن و مجوز Qwen را در huggingface.co بپذیر:
+
+```bash
+export HF_TOKEN="hf_..."
+```
+
+3. فایل دانلودشده را مثلاً اینجا بگذار:
+
+```
+outputs/model_bundle.zip
+```
+
+وزن پایهٔ Qwen2.5-3B اولین بار از Hub دانلود می‌شود (چند گیگ). روی CPU بدون GPU کند است و RAM زیادی می‌خواهد (حدود ۱۲ گیگ برای float32). اگر GPU محلی داری همان اسکریپت CUDA را برمی‌دارد.
+
+### روش A — اسکریپت آماده (پیشنهادی)
+
+یک ورودی و خروج:
+
+```bash
+python3 scripts/run_bundle_inference.py \
+  --bundle outputs/model_bundle.zip \
+  --text "من دانشجوی مهندسی کامپیوتر هستم و می‌خواهم مدل‌های هوش مصنوعی آموزش بدهم. هر روز لپ‌تاپم را با خودم به دانشگاه می‌برم."
+```
+
+حالت تعاملی (مدل یک‌بار لود می‌شود؛ چند متن پشت سر هم بده):
+
+```bash
+python3 scripts/run_bundle_inference.py --bundle outputs/model_bundle.zip
+```
+
+اگر GPU محلی داری: `--cuda` را هم اضافه کن.
+
+### روش B — تکه کد پایتون جدا (`run_local.py`)
+
+فایل `run_local.py` در ریشهٔ ریپو همین کار را می‌کند. مسیر zip و متن را عوض کن، یا مستقیم اجرا کن:
+
+```bash
+cd /Users/webravo/Desktop/ABPSEES
+python3 run_local.py
+# یا:
+python3 run_local.py outputs/model_bundle.zip "متن فارسی خودت اینجا"
+```
+
+معادل همان فایل:
 
 ```python
-from google.colab import drive
-drive.mount('/content/drive')
+from pathlib import Path
 
-!cp -r /content/ABPSEES/outputs /content/drive/MyDrive/ABPSEES/
-!cp -r /content/ABPSEES/outputs/checkpoints/best /content/drive/MyDrive/ABPSEES/checkpoints/
+from project.bundle import load_model_bundle
+from project.inference import predict, pretty_print_prediction
+
+BUNDLE = Path("outputs/model_bundle.zip")  # مسیر فایل دانلودشده از Colab
+
+model, tokenizer, config = load_model_bundle(BUNDLE)
+
+text = (
+    "من دانشجوی مهندسی کامپیوتر هستم و می‌خواهم مدل‌های هوش مصنوعی آموزش بدهم. "
+    "هر روز لپ‌تاپم را با خودم به دانشگاه می‌برم."
+)
+result = predict(text, config, model=model, tokenizer=tokenizer)
+print(pretty_print_prediction(result))
+```
+
+خروجی یک JSON با پنج جنبه است (`performance`, `portability`, `design`, `durability`, `cost_effectiveness`)؛ هر کدام `score` و `evidence`. اگر aspect heads فعال باشد، فیلد `_aspect_attention` هم در `result` هست.
+
+برای چند ورودی پشت سر هم، مدل را **یک‌بار** لود کن و فقط `predict` را تکرار کن:
+
+```python
+while True:
+    text = input("متن ورودی > ").strip()
+    if not text:
+        break
+    result = predict(text, config, model=model, tokenizer=tokenizer)
+    print(pretty_print_prediction(result))
 ```
 
 ---
 
-## قدم ۹ — Inference
+## قدم ۹ — Inference روی Colab
 
 ```python
 from project.inference import predict, pretty_print_prediction
@@ -266,6 +393,7 @@ print(pretty_print_prediction(result))
 | `data/synthetic/` | داده synthetic |
 | `data/processed/` | train/val/test splits |
 | `outputs/checkpoints/best/` | LoRA adapter آموزش‌دیده |
+| `outputs/model_bundle.zip` | **یک فایل** برای دانلود و اجرای لوکال |
 | `outputs/reports/` | گزارش ارزیابی |
 | `outputs/tensorboard/` | لاگ TensorBoard |
 
@@ -278,7 +406,9 @@ print(pretty_print_prediction(result))
 | `CUDA GPU is required` | Runtime → Change runtime type → T4 GPU |
 | خطای دانلود مدل | Secret `HF_TOKEN` را اضافه کن؛ مجوز Qwen را بپذیر |
 | `OutOfMemoryError` | `max_seq_length` را به `1024` کاهش بده یا `per_device_train_batch_size` را `1` کن |
-| session قطع شد | checkpoint‌ها را روی Drive ذخیره کن؛ با `resume_from_checkpoint` ادامه بده |
+| session قطع شد | `model_bundle.zip` یا checkpoint‌ها را روی Drive ذخیره کن؛ با `resume_from_checkpoint` ادامه بده |
+| `model_bundle.zip` پیدا نشد | اول `train_model(config)` را تمام کن؛ فایل در `outputs/model_bundle.zip` است |
+| inference لوکال خیلی کند / RAM کم | مدل ۳B روی CPU سنگین است؛ GPU محلی یا همان Colab را برای inference استفاده کن |
 | `bitsandbytes` error | `!pip install -q bitsandbytes` را دوباره اجرا کن |
 
 ### ادامه آموزش از checkpoint
@@ -347,6 +477,15 @@ from project.trainer import train_model
 config = load_config()
 setup_colab_environment("HF_TOKEN")
 train_model(config)
+# بعد از آموزش: outputs/model_bundle.zip ساخته می‌شود و دانلود مرورگر شروع می‌شود.
 ```
 
 > قبل از اجرا: GPU را فعال کن و Secret `HF_TOKEN` را اضافه کن.
+
+بعد از دانلود zip، روی لپ‌تاپ:
+
+```bash
+python3 scripts/run_bundle_inference.py \
+  --bundle outputs/model_bundle.zip \
+  --text "متن فارسی کاربر..."
+```

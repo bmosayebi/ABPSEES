@@ -320,4 +320,23 @@ def train_model(
         trainer.save_model(str(best_dir))
         logger.info("Saved best adapter to %s", best_dir)
 
+    # Package the checkpoint into a single portable .zip file so it can be
+    # downloaded from Colab (or copied elsewhere) as one artifact instead of
+    # a multi-file directory. See project/bundle.py and COLAB.md.
+    from project.bundle import save_model_bundle
+
+    try:
+        bundle_path = save_model_bundle(config, best_dir)
+        logger.info("Saved single-file model bundle to %s", bundle_path)
+        if is_colab():
+            from project.bundle import download_bundle_on_colab
+
+            download_bundle_on_colab(bundle_path)
+    except Exception:
+        logger.exception(
+            "Failed to create the single-file model bundle; the checkpoint "
+            "directory at %s is still valid and usable directly.",
+            best_dir,
+        )
+
     return trainer
