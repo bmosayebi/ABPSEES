@@ -82,19 +82,27 @@ def load_base_model(
     model_kwargs: dict[str, Any] = {
         "trust_remote_code": config.model.trust_remote_code,
         "attn_implementation": device_cfg.attn_implementation,
-        "low_cpu_mem_usage": True,
+        "torch_dtype": device_cfg.torch_dtype,
     }
 
     if bnb_config is not None:
         model_kwargs["quantization_config"] = bnb_config
         model_kwargs["device_map"] = "auto"
-        model_kwargs["torch_dtype"] = device_cfg.torch_dtype
-    else:
-        model_kwargs["torch_dtype"] = device_cfg.torch_dtype
+        model_kwargs["low_cpu_mem_usage"] = True
+    elif device_cfg.device == "cuda":
         model_kwargs["device_map"] = "auto"
+        model_kwargs["low_cpu_mem_usage"] = True
+    else:
+        # CPU / MPS: do NOT use device_map="auto" or low_cpu_mem_usage.
+        # Those leave meta tensors; PEFT then fails to copy LoRA weights
+        # (UserWarning: copying to a meta parameter) and crashes with
+        # KeyError: 'base_model.model.model.model.embed_tokens'.
+        model_kwargs["low_cpu_mem_usage"] = False
 
     empty_cuda_cache()
     model = AutoModelForCausalLM.from_pretrained(config.model.name, **model_kwargs)
+    if bnb_config is None and device_cfg.device != "cuda":
+        model = model.to(device_cfg.device)
 
     if bnb_config is not None:
         model = prepare_model_for_kbit_training(model)
@@ -139,7 +147,11 @@ def load_model_for_inference(
     base_model = load_base_model(config, device_cfg)
 
     if adapter_path:
-        model = PeftModel.from_pretrained(base_model, adapter_path)
+        model = PeftModel.from_pretrained(
+            base_model,
+            adapter_path,
+            is_trainable=False,
+        )
         model.eval()
         logger.info("Loaded LoRA adapter from %s", adapter_path)
     else:

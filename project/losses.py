@@ -7,18 +7,27 @@ language modeling cross-entropy loss on assistant-response tokens only
 (:mod:`project.aspect_attention`) and combines all four into the single
 scalar loss optimized end-to-end:
 
-    L = lambda_ce   * L_CE     (unchanged generative JSON loss)
-      + lambda_score * L_score  (per-aspect score regression)
-      + lambda_span  * L_span   (per-aspect start/end span classification)
-      + lambda_faith * L_faith  (faithfulness self-consistency regularizer)
+    L = lambda_ce      * L_CE       (unchanged generative JSON loss)
+      + lambda_score   * L_score    (per-aspect score regression)
+      + lambda_span    * L_span     (per-aspect start/end span classification)
+      + lambda_faith   * L_faith    (faithfulness self-consistency regularizer)
+      + lambda_disjoint * L_disjoint (cross-aspect evidence-exclusivity regularizer)
 
-All four terms are computed per-batch and averaged; the lambda weights come
+All five terms are computed per-batch and averaged; the lambda weights come
 from :class:`project.config.AspectConfig` and are applied by
 :class:`project.trainer.AspectGuidedTrainer`, which is the sole caller of
 :func:`compute_total_loss`. Keeping the weighting logic out of the model
 (:mod:`project.hybrid_model`) means the model's forward pass always returns
 well-defined, un-weighted quantities that are easy to unit test in
 isolation.
+
+``L_disjoint`` (:func:`disjoint_span_loss_fn`) was added after diagnosing a
+recurring failure mode where the model reports a plausible ``score`` for an
+aspect but attributes another aspect's evidence text to it (e.g. a price
+clause quoted as ``performance`` evidence). Neither ``L_span`` nor
+``L_faith`` penalizes this directly: both only look at whether an aspect's
+*own* attention aligns with its *own* gold span, never whether it also
+leaks onto a *different* aspect's gold span. ``L_disjoint`` closes that gap.
 """
 
 from __future__ import annotations
@@ -277,6 +286,54 @@ def faithfulness_loss_fn(
     return total, components
 
 
+def disjoint_span_loss_fn(
+    attn_weights: "torch.Tensor",
+    start_labels: "torch.Tensor",
+    end_labels: "torch.Tensor",
+) -> tuple["torch.Tensor", dict[str, float]]:
+    """Cross-aspect evidence-exclusivity regularizer.
+
+    :func:`faithfulness_loss_fn`'s ``term_high`` already rewards an aspect
+    for concentrating attention *inside its own* gold evidence span, but it
+    is silent about what happens *outside* that span -- an aspect's
+    attention is free to also place mass on a different aspect's gold span
+    with no penalty. That gap is exactly the observed failure mode: the
+    model attributes one aspect's evidence text to another aspect (e.g.
+    quoting the price clause as ``performance`` evidence). This loss adds
+    the missing penalty: for every aspect ``a`` in a sample, it measures how
+    much of ``a``'s attention mass falls on tokens that are *some other*
+    aspect's gold evidence span, and penalizes that "leaked" mass.
+
+    Args:
+        attn_weights: ``[B, A, T]`` aspect-attention weights (post-softmax).
+        start_labels: ``[B, A]`` gold start indices (``-100`` if none).
+        end_labels: ``[B, A]`` gold end indices (``-100`` if none).
+
+    Returns:
+        Tuple of ``(scalar_loss, component_dict)`` where ``component_dict``
+        has a single float value under ``disjoint_loss`` (for logging).
+    """
+    import torch
+
+    num_tokens = attn_weights.shape[-1]
+    gold_mask = _build_gold_span_mask(start_labels, end_labels, num_tokens)  # [B, A, T]
+
+    # `other_gold_mask[b, a, t] = 1` iff some aspect other than `a` has a
+    # gold-evidence token at position `t` in sample `b`. Built by summing
+    # every aspect's gold mask and subtracting the current aspect's own
+    # mask, so an aspect is never penalized for attending to its own span.
+    total_gold_mask = gold_mask.sum(dim=1, keepdim=True)  # [B, 1, T]
+    other_gold_mask = (total_gold_mask - gold_mask).clamp(min=0.0, max=1.0)  # [B, A, T]
+
+    leaked_mass = (attn_weights * other_gold_mask).sum(dim=-1)  # [B, A]
+    has_other_evidence = (other_gold_mask.sum(dim=-1) > 0).float()  # [B, A]
+
+    eps = 1.0
+    loss = (leaked_mass * has_other_evidence).sum() / (has_other_evidence.sum() + eps)
+    components = {"disjoint_loss": float(loss.detach().item())}
+    return loss, components
+
+
 def compute_total_loss(
     ce_loss: "torch.Tensor",
     aspect_scores: "torch.Tensor",
@@ -290,10 +347,11 @@ def compute_total_loss(
     attn_weights: "torch.Tensor",
     aspect_config: "AspectConfig",
 ) -> tuple["torch.Tensor", dict[str, float]]:
-    """Combine the generative CE loss with the three auxiliary objectives.
+    """Combine the generative CE loss with the four auxiliary objectives.
 
     ``L = lambda_ce * ce_loss + lambda_score * score_loss``
     ``  + lambda_span * span_loss + lambda_faith * faith_loss``
+    ``  + lambda_disjoint * disjoint_loss``
 
     Args:
         ce_loss: Scalar causal-LM cross-entropy from the base model.
@@ -311,8 +369,8 @@ def compute_total_loss(
     Returns:
         Tuple of ``(total_loss, components)`` where ``components`` is a
         flat ``dict[str, float]`` suitable for logging (``ce_loss``,
-        ``score_loss``, ``span_loss``, ``faith_loss`` and its three
-        sub-terms, and ``total_loss``).
+        ``score_loss``, ``span_loss``, ``faith_loss``/``disjoint_loss`` and
+        their sub-terms, and ``total_loss``).
     """
     score_loss = score_loss_fn(aspect_scores, aspect_scores_gt)
     evidence_loss = has_evidence_loss_fn(has_evidence_logits, has_evidence_labels)
@@ -327,6 +385,11 @@ def compute_total_loss(
         low_threshold=aspect_config.low_score_threshold,
         high_threshold=aspect_config.high_score_threshold,
     )
+    disjoint_loss, disjoint_components = disjoint_span_loss_fn(
+        attn_weights=attn_weights,
+        start_labels=start_labels,
+        end_labels=end_labels,
+    )
 
     # The has-evidence BCE is part of the (Phase 2) span-prediction
     # objective family -- it supervises the same "where is the evidence"
@@ -339,6 +402,7 @@ def compute_total_loss(
         + aspect_config.lambda_score * score_loss
         + aspect_config.lambda_span * combined_span_loss
         + aspect_config.lambda_faith * faith_loss
+        + aspect_config.lambda_disjoint * disjoint_loss
     )
 
     components = {
@@ -349,5 +413,6 @@ def compute_total_loss(
         "faith_loss": float(faith_loss.detach().item()),
         "total_loss": float(total.detach().item()),
         **faith_components,
+        **disjoint_components,
     }
     return total, components

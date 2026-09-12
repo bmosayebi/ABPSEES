@@ -46,12 +46,31 @@ def validate_evidence_in_text(
     return warnings
 
 
+def labels_from_aspect_heads(diagnostics: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Build the standard ``{aspect: {score, evidence}}`` dict from head outputs.
+
+    Used by the fast (non-generative) inference path: one encoder-style
+    forward through Qwen + the trained score/span heads, no token-by-token
+    JSON generation.
+    """
+    labels: dict[str, dict[str, Any]] = {}
+    per_aspect = diagnostics["per_aspect"]
+    for aspect in ASPECTS:
+        entry = per_aspect[aspect]
+        labels[aspect] = {
+            "score": float(entry["score_head"]),
+            "evidence": str(entry.get("span_evidence") or ""),
+        }
+    return labels
+
+
 def predict(
     text: str,
     config: AppConfig,
     adapter_path: str | Path | None = None,
     model: Any | None = None,
     tokenizer: Any | None = None,
+    use_generation: bool = True,
 ) -> dict[str, Any]:
     """Run inference on a single Persian text input.
 
@@ -61,6 +80,11 @@ def predict(
         adapter_path: Optional LoRA adapter path.
         model: Optional pre-loaded model.
         tokenizer: Optional pre-loaded tokenizer.
+        use_generation: If ``True`` (default, used by Colab eval), generate
+            the JSON completion token-by-token (slow on CPU/MPS). If
+            ``False`` and aspect heads are available, skip generation and
+            read scores/evidence from the heads in a single forward pass
+            — this is what the desktop UI uses.
 
     Returns:
         Dict with ``labels`` key and optional ``_warnings`` and (when
@@ -76,36 +100,47 @@ def predict(
         else:
             model, tokenizer = load_model_for_inference(config, str(adapter_path))
 
-    raw = generate_prediction(model, tokenizer, text, config)
-    parsed, error = parse_model_output(raw)
-    labels = normalize_parsed_labels(parsed)
+    if (
+        not use_generation
+        and config.aspect.enabled
+        and hasattr(model, "aspect_heads")
+    ):
+        from project.hybrid_model import run_aspect_heads_on_text
 
-    result: dict[str, Any] = {"labels": labels, "raw_output": raw}
-    if parsed is None:
-        result["_warnings"] = [f"JSON parse error: {error}"]
+        diagnostics = run_aspect_heads_on_text(model, tokenizer, text, config)
+        labels = labels_from_aspect_heads(diagnostics)
+        result: dict[str, Any] = {
+            "labels": labels,
+            "raw_output": "",
+            "_aspect_attention": diagnostics["per_aspect"],
+            "_mode": "aspect_heads",
+        }
+    else:
+        raw = generate_prediction(model, tokenizer, text, config)
+        parsed, error = parse_model_output(raw)
+        labels = normalize_parsed_labels(parsed)
 
-    if config.aspect.enabled and hasattr(model, "aspect_heads"):
-        try:
-            from project.hybrid_model import run_aspect_heads_on_text
+        result = {"labels": labels, "raw_output": raw, "_mode": "generation"}
+        if parsed is None:
+            result["_warnings"] = [f"JSON parse error: {error}"]
 
-            diagnostics = run_aspect_heads_on_text(model, tokenizer, text, config)
-            result["_aspect_attention"] = diagnostics["per_aspect"]
+        if config.aspect.enabled and hasattr(model, "aspect_heads"):
+            try:
+                from project.hybrid_model import run_aspect_heads_on_text
 
-            # Repair/override the generated JSON's evidence with the
-            # span-head's decoded substring whenever it is invalid (empty
-            # while the score suggests otherwise, or not a real substring
-            # of the input) or whenever `aspect.prefer_span_evidence` opts
-            # into always trusting the extractive span head.
-            for aspect in ASPECTS:
-                entry = diagnostics["per_aspect"][aspect]
-                current_evidence = labels[aspect]["evidence"]
-                current_valid = current_evidence == "" or current_evidence in text
-                if config.aspect.prefer_span_evidence or not current_valid:
-                    labels[aspect]["evidence"] = entry["span_evidence"]
-        except Exception:
-            logger.exception(
-                "Aspect head diagnostics failed; continuing with generative-only prediction."
-            )
+                diagnostics = run_aspect_heads_on_text(model, tokenizer, text, config)
+                result["_aspect_attention"] = diagnostics["per_aspect"]
+
+                for aspect in ASPECTS:
+                    entry = diagnostics["per_aspect"][aspect]
+                    current_evidence = labels[aspect]["evidence"]
+                    current_valid = current_evidence == "" or current_evidence in text
+                    if config.aspect.prefer_span_evidence or not current_valid:
+                        labels[aspect]["evidence"] = entry["span_evidence"]
+            except Exception:
+                logger.exception(
+                    "Aspect head diagnostics failed; continuing with generative-only prediction."
+                )
 
     if config.inference.faithfulness_warn:
         warnings = validate_evidence_in_text(

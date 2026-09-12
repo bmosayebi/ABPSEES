@@ -19,7 +19,9 @@ sync.
 2. [Background: Self-Attention vs. Aspect-Conditioned Attention](#2-background-self-attention-vs-aspect-conditioned-attention)
 3. [Formal Notation: Phase 1 and Phase 2 Objectives](#3-formal-notation-phase-1-and-phase-2-objectives)
 4. [Faithfulness Regularization: Justification](#4-faithfulness-regularization-justification)
+   - [4.1 Cross-Aspect Disjointness: the Evidence-Misattribution Failure Mode](#41-cross-aspect-disjointness-the-evidence-misattribution-failure-mode)
 5. [End-to-End Implementation Walkthrough](#5-end-to-end-implementation-walkthrough)
+   - [5.7 Synthetic Dataset Design: Avoiding Positional & Distributional Shortcuts](#57-synthetic-dataset-design-avoiding-positional--distributional-shortcuts)
 6. [Hyperparameter Guidance for Colab T4](#6-hyperparameter-guidance-for-colab-t4)
 7. [Expected Metrics and Ablation Checklist](#7-expected-metrics-and-ablation-checklist)
 8. [References](#8-references)
@@ -182,15 +184,18 @@ the evidence" question).
 ### Combined Objective
 
 \[
-L = \lambda_{ce} L_{CE}(\text{JSON}) + \lambda_{score} L_{\text{score}} + \lambda_{span}\big(\tfrac12 L_{\text{span}} + \tfrac12 L_{\text{has\_ev}}\big) + \lambda_{faith} L_{\text{faith}}
+L = \lambda_{ce} L_{CE}(\text{JSON}) + \lambda_{score} L_{\text{score}} + \lambda_{span}\big(\tfrac12 L_{\text{span}} + \tfrac12 L_{\text{has\_ev}}\big) + \lambda_{faith} L_{\text{faith}} + \lambda_{disjoint} L_{\text{disjoint}}
 \]
 
-with defaults \(\lambda_{ce}=1.0,\ \lambda_{score}=0.5,\ \lambda_{span}=0.5,\
-\lambda_{faith}=0.1\) (`config/default.yaml`, `config/colab.yaml`, the
-`aspect:` section). \(L_{CE}\) is computed by the base Qwen model exactly
-as before (unchanged); the other three terms are computed by
-`project/losses.py::compute_total_loss` and combined by
-`project/trainer.py::AspectGuidedTrainer.compute_loss`.
+with defaults \(\lambda_{ce}=1.0,\ \lambda_{score}=0.5,\ \lambda_{span}=0.8,\
+\lambda_{faith}=0.1,\ \lambda_{disjoint}=0.2\) (`config/default.yaml`,
+`config/colab.yaml`, the `aspect:` section). \(L_{CE}\) is computed by the
+base Qwen model exactly as before (unchanged); the other four terms are
+computed by `project/losses.py::compute_total_loss` and combined by
+`project/trainer.py::AspectGuidedTrainer.compute_loss`. \(L_{\text{disjoint}}\)
+is described in §4.1 below — it was added after diagnosing a recurring
+evidence-misattribution failure mode that none of the other three terms
+directly penalize.
 
 ## 4. Faithfulness Regularization: Justification
 
@@ -231,6 +236,58 @@ modes are reported directly via
 and low-score/non-empty-evidence), giving a concrete, monitorable proxy
 for "is the model's JSON output trustworthy," independent of raw score
 accuracy.
+
+### 4.1 Cross-Aspect Disjointness: the Evidence-Misattribution Failure Mode
+
+An evidence-misattribution investigation (triggered by real user reports —
+e.g. a cost-effectiveness clause like "ارزون و قیمت مناسب باشه" being
+returned as `performance`'s evidence, or a durability clause "خرابی
+نداشته باشد" being duplicated onto `performance`) found a real gap in the
+loss design above: **`term_high` only checks whether an aspect's own
+attention is concentrated inside its own gold span; nothing anywhere in
+`L_{\text{score}}`, `L_{\text{span}}`, or `L_{\text{faith}}` penalizes that
+same aspect's attention *also* landing on a different aspect's gold span.**
+Two aspects can therefore both score well on `term_high` (each keeps most
+of its own mass on its own span) while still leaking a damaging amount of
+probability mass onto each other's evidence — which is precisely what the
+span head's `decode_best_span` (an independent, per-aspect arg-max scan,
+§ `project/aspect_attention.py`) can end up selecting when two aspects'
+clauses sit close together in the input text.
+
+`disjoint_span_loss_fn` (`project/losses.py`) closes this gap directly.
+For every aspect \(a\) in a sample, let
+\(G_{\neg a} = \bigcup_{b \neq a} [\text{start}_b, \text{end}_b]\) be the
+union of every *other* aspect's gold evidence tokens (built once per batch
+via `_build_gold_span_mask`, then aggregated across the aspect axis and
+subtracting out \(a\)'s own span so \(a\) is never penalized for attending
+to itself):
+
+\[
+\text{leak}_a = \sum_{t \in G_{\neg a}} \alpha_a(t), \qquad
+L_{\text{disjoint}} = \frac{\sum_{a\,:\,G_{\neg a} \neq \emptyset} \text{leak}_a}
+                             {\big|\{a : G_{\neg a} \neq \emptyset\}\big| + 1}
+\]
+
+i.e. the mean, over aspect-sample pairs that actually have *some* other
+aspect's evidence to leak onto, of how much attention mass got misplaced
+there. When no other aspect has gold evidence in a sample (e.g. a
+single-aspect sample), the denominator's `+1` smoothing keeps the loss at
+a well-defined `0` rather than `0/0`. This is intentionally the mirror
+image of `term_high`: `term_high` pulls mass *in* toward the aspect's own
+span; `L_{\text{disjoint}}` pushes mass *away* from every other aspect's
+span — together they encourage a genuinely exclusive, one-aspect-per-token
+attention allocation instead of merely a "good enough on average" one.
+
+Because `L_{\text{disjoint}}` only depends on `attn_weights` and the gold
+`start_labels`/`end_labels` (already computed for `L_{\text{span}}` and
+`term_high`), it required no new inputs to `compute_total_loss` — only a
+new `lambda_disjoint` weight on `AspectConfig` (default `0.2`, set
+conservatively lower than `lambda_span` since it is a regularizer on a
+*negative* space, not a direct supervision signal). See
+`tests/test_aspect_attention.py::TestLossFunctions::test_disjoint_span_loss_penalizes_attending_to_other_aspect_span`
+for a minimal worked example (an aspect whose attention sits entirely on
+another aspect's gold span incurs a large loss; one that attends only to
+its own gold span incurs zero loss).
 
 ## 5. End-to-End Implementation Walkthrough
 
@@ -284,7 +341,8 @@ the non-aspect path.
 to pop the aspect labels out of the batch, run the model, and combine
 everything via `project/losses.py::compute_total_loss`, logging each
 component (`ce_loss`, `score_loss`, `span_loss`, `faith_loss` and its
-three sub-terms) alongside the standard Trainer logs.
+three sub-terms, and `disjoint_loss`, §4.1) alongside the standard Trainer
+logs.
 `project/trainer.py::build_trainer` branches on `config.aspect.enabled`:
 when `true`, it builds the hybrid model + `AspectAwareCollator` +
 `AspectGuidedTrainer`; when `false`, the original CE-only `Trainer` path
@@ -329,6 +387,66 @@ used for distribution or downstream inference.
   `aspect.prefer_span_evidence: true`, and always attaches
   `_aspect_attention` diagnostics to the result dict.
 
+### 5.7 Synthetic Dataset Design: Avoiding Positional & Distributional Shortcuts
+
+The same evidence-misattribution investigation that motivated §4.1 also
+found that `project/dataset.py`'s synthetic generator was itself a
+significant contributor to the failure mode — independently of any
+architecture gap. The original generator had three specific defects, each
+a *shortcut* the model could learn instead of real semantics:
+
+1. **`performance` was structurally privileged.** Its "need" clause was
+   interpolated into the intro sentence *and* re-appended immediately
+   after, so `performance`'s gold evidence always started at the same
+   leading character offset, in 100% of samples — and `performance` always
+   had non-empty evidence, unlike every other aspect (which had a random
+   45% empty-evidence rate). A model can fit this distribution by learning
+   "the first clause is `performance`'s evidence" without ever attending to
+   its actual semantic content.
+2. **Low template diversity.** Each non-performance aspect had only 3-4
+   fixed, formal-register template sentences, so the span head saw very
+   little lexical variety and could overfit to exact phrase matches rather
+   than the underlying concept (e.g. never seeing colloquial price
+   language like "ارزون"/"مقرون به صرفه"/"بودجه کم" that real users
+   actually type).
+3. **Fixed clause ordering.** Non-performance clauses were always appended
+   in the same `["portability", "design", "durability",
+   "cost_effectiveness"]` order at the end of the text, reinforcing a
+   position-to-aspect mapping that has nothing to do with meaning.
+
+The rewritten generator removes all three shortcuts:
+
+- **No aspect is privileged.** All five aspects (including `performance`)
+  independently get a clause with the same `_ASPECT_INCLUDE_PROB` (`0.6`)
+  probability, each drawing from its own `_ASPECT_CLAUSES` pool; the
+  resulting clause list is shuffled (`rng.shuffle`) before being joined
+  into the final text, so clause position never correlates with aspect
+  identity. `tests/test_core.py::TestSyntheticData::test_performance_is_not_always_present_or_first`
+  is a direct regression guard for this.
+- **15-20 clauses per aspect, mixing register.** Each aspect's
+  `_ASPECT_CLAUSES` list mixes formal Persian ("می‌خواهم عملکرد بالایی
+  برای کارهای سنگین داشته باشد") with colloquial/spoken forms ("میخوام
+  سریع باشه", "ارزون و قیمت مناسب باشه", "بودجه‌م محدوده") to match the
+  actual register distribution of real user input.
+- **Hard-negative "combo" sentences.** `_COMBO_CLAUSES` is a small
+  fixed list of sentences that pack *two* aspects' concepts into one
+  sentence with clearly separable, non-overlapping sub-spans (e.g.
+  "کارایی بالا برام مهمه، ولی قیمتش هم باید مناسب باشه" — the first clause
+  is `performance` evidence, the second is `cost_effectiveness` evidence).
+  These fire with `_COMBO_PROB` (`0.25`) probability per sample and force
+  the span head to disambiguate two aspects that are textually adjacent,
+  which is exactly the situation observed in the original bug reports.
+  `test_combo_hard_negatives_produce_disjoint_adjacent_spans` verifies the
+  two sub-spans never overlap.
+
+`data.synthetic_num_samples` was also raised from `200` to `1200`
+(`config/default.yaml`, `config/colab.yaml`) — with 5 independent
+per-aspect inclusion draws plus a 25% combo-injection chance, 200 samples
+under-represents many aspect/register/ordering combinations; 1200 gives
+each `_ASPECT_CLAUSES` entry and each `_COMBO_CLAUSES` template enough
+repeated exposure across different roles/orderings to be learned
+robustly.
+
 ## 6. Hyperparameter Guidance for Colab T4
 
 The aspect heads add a negligible number of parameters relative to the 3B
@@ -340,11 +458,13 @@ module on a 16GB T4. Practical guidance specific to `aspect.*`:
 
 | Parameter | Guidance |
 |---|---|
-| `hidden_layer` | `-1` (last layer) is the default and works well since it is closest to the CE objective's own representation; try `-6`/mid-stack only if you observe attention collapsing to a few tokens uniformly across aspects. |
+| `hidden_layer` | `-1` (last layer) is the default and works well since it is closest to the CE objective's own representation. **Sweep option:** if evidence attribution errors persist after retraining with §4.1/§5.7's fixes, try a mid-stack layer instead — e.g. `-12` for Qwen2.5-3B's 36 decoder layers — since attention at the very last layer is heavily shaped by the imminent next-token (JSON-generation) objective, which can dilute a purely aspect-semantic signal; a middle layer's representation is more likely to encode "what is this span about" independent of "what JSON token comes next." This is an ablation to run and compare via `compute_head_span_metrics` (§7 / §`validation-cells`), not a change to the shipped default — only adopt a non-default value if it measurably improves validation span F1/EM. |
 | `attn_dropout` | `0.1` is a safe default; increase toward `0.2` if attention overfits to a few frequent evidence phrases on a small dataset. |
-| `score_hidden` | `256` is intentionally small (the score head is a 2-layer MLP on a pooled `[D]` vector, not a sequence model) — increasing it rarely helps given ~200 synthetic training samples. |
-| `lambda_score` / `lambda_span` | Keep at `0.5` each; if the generative JSON loss plateaus much higher than the auxiliary losses (check the per-component logs), reduce both toward `0.2`–`0.3` to avoid the auxiliary heads dominating the shared backbone's gradient. |
+| `score_hidden` | `256` is intentionally small (the score head is a 2-layer MLP on a pooled `[D]` vector, not a sequence model) — increasing it rarely helps given the dataset sizes here. |
+| `lambda_score` | Keep at `0.5`; if the generative JSON loss plateaus much higher than the auxiliary losses (check the per-component logs), reduce toward `0.2`–`0.3` to avoid the auxiliary heads dominating the shared backbone's gradient. |
+| `lambda_span` | Default raised from `0.5` to `0.8` (§4.1/§5.7 fix) — evidence-span quality was the primary observed weakness (scores were "relatively good"; evidence was frequently wrong), so the span-related objective (`0.5*(L_span + L_has_ev)`) is now weighted above `lambda_score` rather than equal to it. Reduce back toward `0.5` only if you observe span supervision now dominating and *score* MAE regressing. |
 | `lambda_faith` | Keep small (`0.1`); this is a regularizer, not a primary objective — values above `0.3` risk trading off score/span accuracy for consistency. |
+| `lambda_disjoint` | New in this fix (§4.1), default `0.2` — the cross-aspect evidence-exclusivity regularizer. Set it lower than `lambda_span` since it only penalizes a *negative* space (attention landing on another aspect's span) rather than directly supervising the correct span; raise toward `0.3`–`0.4` if `disjoint_loss` in the training logs stays high and evidence still visibly leaks across aspects after retraining, but watch `term_high`/span F1 for regression if you do. |
 | `low_score_threshold` / `high_score_threshold` | `0.25`/`0.5` mirror `LOW_SCORE_EVIDENCE_THRESHOLD` already used by the synthetic data generator (`project/dataset.py`), keeping the faithfulness regularizer's notion of "low"/"high" consistent with how the training data itself was labeled. |
 | `prefer_span_evidence` | `false` during early experimentation (only *repairs* invalid generated evidence); switch to `true` once span-head Token F1 on the validation set clearly exceeds the generative JSON's own evidence-validity rate. |
 
@@ -378,6 +498,21 @@ Compare, in order, on the same held-out test split
    from step 3 to *decrease* measurably, ideally without a corresponding
    regression in score MAE or span F1 — this is the key ablation result
    that justifies including the regularizer.
+5. **+ disjoint regularizer, regenerated dataset** (`+lambda_disjoint`,
+   §4.1, retrained on the de-biased/expanded synthetic data from §5.7):
+   this is the fix under evaluation for the evidence-misattribution
+   report. Track a **cross-aspect evidence-overlap rate** — the fraction
+   of test samples where two different aspects' decoded evidence spans
+   (`decode_spans_for_sample`) overlap or one aspect's decoded evidence
+   exactly matches a *different* aspect's gold evidence — before vs. after
+   this change; it should drop substantially. Also re-check the original
+   two reported examples (or minimal paraphrases of them) manually: does
+   `cost_effectiveness` now correctly pick up price/budget language
+   instead of `performance` claiming it, and does `durability`'s
+   no-breakdown clause stay attributed to `durability` alone? See
+   `validation-cells` in `COLAB.md`/`COLAB-RUN.md` for ready-to-run cells
+   that compute before/after `compute_head_span_metrics` on the same
+   held-out split.
 
 Also inspect a handful of `plot_aspect_attention_heatmap` outputs
 qualitatively: attention mass for `performance` should visibly

@@ -168,6 +168,13 @@ class AspectConfig:
     high_score_threshold: float
     prefer_span_evidence: bool
     heads_checkpoint_name: str
+    # Weight for the cross-aspect disjoint-span regularizer (see
+    # project.losses.disjoint_span_loss_fn). Penalizes an aspect's attention
+    # placing mass on tokens that are another aspect's gold evidence span in
+    # the same sample, discouraging evidence "stealing" between aspects.
+    # Defaulted here (rather than only in the YAML configs) so that older
+    # saved bundles/metadata without this key still load correctly.
+    lambda_disjoint: float = 0.2
 
 
 @dataclass
@@ -238,8 +245,9 @@ def _default_aspect_config() -> dict[str, Any]:
         "score_hidden": 256,
         "lambda_ce": 1.0,
         "lambda_score": 0.5,
-        "lambda_span": 0.5,
+        "lambda_span": 0.8,
         "lambda_faith": 0.1,
+        "lambda_disjoint": 0.2,
         "low_score_threshold": 0.25,
         "high_score_threshold": 0.5,
         "prefer_span_evidence": False,
@@ -268,6 +276,7 @@ def _parse_aspect_config(raw: dict[str, Any] | None) -> AspectConfig:
         lambda_score=float(merged["lambda_score"]),
         lambda_span=float(merged["lambda_span"]),
         lambda_faith=float(merged["lambda_faith"]),
+        lambda_disjoint=float(merged["lambda_disjoint"]),
         low_score_threshold=low,
         high_score_threshold=high,
         prefer_span_evidence=bool(merged["prefer_span_evidence"]),

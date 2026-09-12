@@ -6,7 +6,8 @@ Fine-tune [Qwen2.5-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct)
 
 ## Quick Start (Colab)
 
-See **[COLAB.md](COLAB.md)** for the full step-by-step guide in Persian.
+See **[COLAB.md](COLAB.md)** for the full step-by-step guide in Persian.  
+For **inference only** (load a trained bundle from Drive, no training): **[COLAB-RUN.md](COLAB-RUN.md)**.
 
 ```python
 # In Colab — after cloning to /content/ABPSEES

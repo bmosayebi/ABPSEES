@@ -126,6 +126,15 @@ def get_device_config(require_cuda: bool = False) -> DeviceConfig:
             "In Colab: Runtime -> Change runtime type -> T4 GPU."
         )
 
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        logger.info("Using Apple MPS device")
+        return DeviceConfig(
+            device="mps",
+            use_qlora=False,
+            torch_dtype=torch.float16,
+            attn_implementation="sdpa",
+        )
+
     logger.warning("CUDA not available; falling back to CPU (not recommended for training).")
     return DeviceConfig(
         device="cpu",

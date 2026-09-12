@@ -278,6 +278,47 @@ class TestLossFunctions:
         assert set(components.keys()) == {"faith_low", "faith_high", "faith_consistency"}
         assert not bool(torch.isnan(loss))
 
+    def test_disjoint_span_loss_zero_when_no_overlap_or_no_gt(self) -> None:
+        """No aspect has evidence -> nothing to leak onto -> zero loss."""
+        from project.losses import disjoint_span_loss_fn
+
+        b, a, t = 2, 5, 8
+        attn_weights = torch.softmax(torch.randn(b, a, t), dim=-1)
+        start_labels = torch.full((b, a), -100, dtype=torch.long)
+        end_labels = torch.full((b, a), -100, dtype=torch.long)
+
+        loss, components = disjoint_span_loss_fn(attn_weights, start_labels, end_labels)
+
+        assert loss.item() == pytest.approx(0.0)
+        assert set(components.keys()) == {"disjoint_loss"}
+
+    def test_disjoint_span_loss_penalizes_attending_to_other_aspect_span(self) -> None:
+        """An aspect whose attention sits entirely on another aspect's gold
+        span should incur a large penalty; one that attends only to its own
+        gold span should incur zero penalty."""
+        from project.losses import disjoint_span_loss_fn
+
+        b, a, t = 1, 2, 6
+        # Aspect 0's gold span is tokens [0, 1]; aspect 1's gold span is
+        # tokens [4, 5]. Disjoint, non-overlapping, both present.
+        start_labels = torch.tensor([[0, 4]])
+        end_labels = torch.tensor([[1, 5]])
+
+        # "Bad" attention: aspect 0 puts all its mass on aspect 1's span.
+        bad_attn = torch.zeros(b, a, t)
+        bad_attn[0, 0, 4] = 1.0  # aspect 0 -> token in aspect 1's gold span
+        bad_attn[0, 1, 4] = 1.0  # aspect 1 -> its own gold span (fine)
+        bad_loss, _ = disjoint_span_loss_fn(bad_attn, start_labels, end_labels)
+
+        # "Good" attention: each aspect attends only to its own gold span.
+        good_attn = torch.zeros(b, a, t)
+        good_attn[0, 0, 0] = 1.0
+        good_attn[0, 1, 4] = 1.0
+        good_loss, _ = disjoint_span_loss_fn(good_attn, start_labels, end_labels)
+
+        assert good_loss.item() == pytest.approx(0.0)
+        assert bad_loss.item() > good_loss.item()
+
     def test_compute_total_loss_combines_components_and_backprops(self) -> None:
         from project.config import AspectConfig
         from project.losses import compute_total_loss
@@ -292,6 +333,7 @@ class TestLossFunctions:
             lambda_score=0.5,
             lambda_span=0.5,
             lambda_faith=0.1,
+            lambda_disjoint=0.2,
             low_score_threshold=0.25,
             high_score_threshold=0.5,
             prefer_span_evidence=False,
@@ -332,6 +374,7 @@ class TestLossFunctions:
             "faith_low",
             "faith_high",
             "faith_consistency",
+            "disjoint_loss",
         }
         assert set(components.keys()) == expected_keys
         assert components["total_loss"] == pytest.approx(total.item())
@@ -357,6 +400,7 @@ class TestLossFunctions:
             lambda_score=0.0,
             lambda_span=0.0,
             lambda_faith=0.0,
+            lambda_disjoint=0.0,
             low_score_threshold=0.25,
             high_score_threshold=0.5,
             prefer_span_evidence=False,
@@ -504,3 +548,24 @@ class TestAspectGuidedModelSmoke:
 
         for p1, p2 in zip(model.aspect_heads.parameters(), model2.aspect_heads.parameters()):
             assert torch.allclose(p1, p2)
+
+
+class TestLabelsFromAspectHeads:
+    def test_maps_score_and_span(self) -> None:
+        from project.inference import labels_from_aspect_heads
+
+        diagnostics = {
+            "per_aspect": {
+                aspect: {
+                    "score_head": 0.1 * (i + 1),
+                    "span_evidence": f"ev-{aspect}" if i % 2 == 0 else "",
+                    "has_evidence_prob": 0.9,
+                }
+                for i, aspect in enumerate(ASPECTS)
+            }
+        }
+        labels = labels_from_aspect_heads(diagnostics)
+        assert list(labels) == ASPECTS
+        assert labels["performance"]["score"] == pytest.approx(0.1)
+        assert labels["performance"]["evidence"] == "ev-performance"
+        assert labels["portability"]["evidence"] == ""

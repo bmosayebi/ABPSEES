@@ -67,7 +67,7 @@ data:
   test_ratio: 0.1
   evidence_on_invalid: discard
   normalize_unicode: true
-  synthetic_num_samples: 200
+  synthetic_num_samples: 1200
 
 inference:
   max_new_tokens: 512
@@ -92,8 +92,9 @@ aspect:
   score_hidden: 256
   lambda_ce: 1.0
   lambda_score: 0.5
-  lambda_span: 0.5
+  lambda_span: 0.8
   lambda_faith: 0.1
+  lambda_disjoint: 0.2
   low_score_threshold: 0.25
   high_score_threshold: 0.5
   prefer_span_evidence: true

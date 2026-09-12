@@ -370,17 +370,56 @@ while True:
 
 ---
 
-## قدم ۹ — Inference روی Colab
+## قدم ۹ — Inference روی Colab (لود از `outputs`)
+
+یک‌بار این سل را اجرا کن تا مدل از `outputs` لود شود و تابع `ask` ساخته شود. بعد فقط متن بده.
+
+> ⚠️ متن را **حتماً داخل گیومه** بنویس: `ask("...")`.  
+> نام تابع را `ask` گذاشته‌ایم (نه `run`) چون در Colab/IPython دستور `%run` با نام `run` قاطی می‌شود و متن فارسی را به‌اشتباه به‌عنوان نام فایل `.py` می‌گیرد.
 
 ```python
+from pathlib import Path
+
+from project.bundle import load_model_bundle
 from project.inference import predict, pretty_print_prediction
 
-text = (
-    "من دانشجوی مهندسی کامپیوتر هستم و می خواهم مدل‌های هوش مصنوعی آموزش بدهم. "
-    "هر روز لپ‌تاپم را با خودم به دانشگاه می‌برم."
-)
-result = predict(text, config)
-print(pretty_print_prediction(result))
+OUTPUTS = Path("/content/ABPSEES/outputs")
+BUNDLE = OUTPUTS / "model_bundle.zip"
+CHECKPOINT = OUTPUTS / "checkpoints" / "best"
+
+if BUNDLE.exists():
+    _model, _tokenizer, _config = load_model_bundle(BUNDLE)
+    print("Loaded:", BUNDLE)
+elif CHECKPOINT.exists():
+    from project.config import load_config
+    from project.hybrid_model import load_hybrid_model_for_inference
+
+    _config = load_config()
+    _model, _tokenizer = load_hybrid_model_for_inference(_config, str(CHECKPOINT))
+    print("Loaded:", CHECKPOINT)
+else:
+    raise FileNotFoundError(
+        "خروجی مدل در outputs پیدا نشد. اول train_model را اجرا کن."
+    )
+
+
+def ask(text: str) -> dict:
+    """متن کاربر را می‌گیرد، پیش‌بینی می‌کند و JSON مرتب چاپ می‌کند."""
+    result = predict(text, _config, model=_model, tokenizer=_tokenizer)
+    print(pretty_print_prediction(result))
+    for warning in result.get("_warnings", []):
+        print("[warning]", warning)
+    return result
+
+
+# مثال — گیومه الزامی است:
+ask("من دانشجوی مهندسی کامپیوتر هستم و هر روز لپ‌تاپم را به دانشگاه می‌برم.")
+```
+
+از این به بعد در سل‌های بعدی فقط:
+
+```python
+ask("من یه لپ‌تاپ می‌خوام که ارزون و قیمت مناسب باشه. هر روز باید با خودم ببرمش محل کار.")
 ```
 
 ---
@@ -456,6 +495,152 @@ print(diag["per_aspect"])
 
 ---
 
+## قدم ۱۱ — مقایسه قبل/بعد از رفع مشکل Evidence Misattribution
+
+اگر برای رفع مشکل «evidence اشتباه به aspect غلط نسبت داده می‌شود» طبق
+**[docs/ASPECT_ATTENTION_GUIDE.md §4.1/§5.7](docs/ASPECT_ATTENTION_GUIDE.md#41-cross-aspect-disjointness-the-evidence-misattribution-failure-mode)**
+دوباره train می‌کنی (دیتاست جدید + `lambda_disjoint` + `lambda_span` بالاتر)،
+این سل‌ها یک مقایسهٔ کمّی قبل/بعد روی همان تقسیم `test` می‌سازند.
+
+### سل ۱ — اسنپ‌شات «قبل» (روی مدل فعلی، قبل از retrain)
+
+اگر از قبل یک `outputs/checkpoints/best` (نسخهٔ قدیمی، آموزش‌دیده با کد/دیتاست قبلی) داری، این را همین حالا اجرا کن — قبل از این‌که دیتاست را دوباره بسازی یا دوباره train کنی:
+
+```python
+from pathlib import Path
+
+from project.config import load_config
+from project.evaluation import run_evaluation
+from project.utils import load_json, save_json
+
+_config = load_config()
+_reports = _config.paths.reports_dir
+_reports.mkdir(parents=True, exist_ok=True)
+
+run_evaluation(_config, split="test")  # می‌نویسد: outputs/reports/test_metrics_aspect.json
+
+# کپی با پسوند before تا سل بعدی (retrain) آن را overwrite نکند
+before_metrics = load_json(_reports / "test_metrics_aspect.json")
+before_preds = load_json(_reports / "test_predictions_aspect.json")
+save_json(before_metrics, _reports / "test_metrics_aspect_before.json")
+save_json(before_preds, _reports / "test_predictions_aspect_before.json")
+print("Saved BEFORE snapshot:", _reports / "test_metrics_aspect_before.json")
+```
+
+### سل ۲ — بازسازی دیتاست + retrain
+
+دیتاست را با ژنراتور جدید (بدون bias جای‌گاهی، الگوهای متنوع‌تر، جملات hard-negative) دوباره بساز و مدل را دوباره train کن — کدهای قدم ۵ و قدم ۷ همین بالا را دوباره اجرا کن (کانفیگ `config/colab.yaml` از قبل به‌روز است: `synthetic_num_samples: 1200`, `lambda_span: 0.8`, `lambda_disjoint: 0.2`):
+
+```python
+import shutil
+from pathlib import Path
+
+from project.config import load_config
+from project.dataset import prepare_dataset_splits
+
+_config = load_config()
+
+# دیتاست synthetic قدیمی را پاک کن تا با ژنراتور جدید از صفر ساخته شود
+shutil.rmtree(_config.paths.processed_dir, ignore_errors=True)
+for f in Path(_config.paths.data_dir).glob("*.json"):
+    f.unlink()
+
+prepare_dataset_splits(_config)
+print("Dataset regenerated:", _config.data.synthetic_num_samples, "samples")
+
+# بعد از این، سل‌های «قدم ۷ — آموزش مدل» را دوباره اجرا کن.
+```
+
+### سل ۳ — اسنپ‌شات «بعد» (روی مدل تازه retrain‌شده)
+
+بعد از این‌که آموزش قدم ۷ با موفقیت تمام شد:
+
+```python
+from project.config import load_config
+from project.evaluation import run_evaluation
+from project.utils import load_json, save_json
+
+_config = load_config()
+_reports = _config.paths.reports_dir
+
+run_evaluation(_config, split="test")
+
+after_metrics = load_json(_reports / "test_metrics_aspect.json")
+after_preds = load_json(_reports / "test_predictions_aspect.json")
+save_json(after_metrics, _reports / "test_metrics_aspect_after.json")
+save_json(after_preds, _reports / "test_predictions_aspect_after.json")
+print("Saved AFTER snapshot:", _reports / "test_metrics_aspect_after.json")
+```
+
+### سل ۴ — مقایسهٔ کمّی قبل/بعد
+
+جدول per-aspect span F1/EM + faithfulness rates، به‌همراه یک متریک اختصاصی
+برای همین باگ — **نرخ هم‌پوشانی evidence بین دو aspect مختلف** (چند درصد
+نمونه‌ها حداقل یک جفت aspect دارند که span‌های پیش‌بینی‌شده‌شان با هم
+overlap می‌کنند؛ هر چه این عدد بعد از fix کمتر شود، یعنی مشکل misattribution
+واقعاً حل شده):
+
+```python
+from itertools import combinations
+
+from project.config import load_config
+from project.constants import ASPECTS
+from project.metrics import token_span_to_set
+from project.utils import load_json
+
+_reports = load_config().paths.reports_dir
+
+before = load_json(_reports / "test_metrics_aspect_before.json")
+after = load_json(_reports / "test_metrics_aspect_after.json")
+before_preds = load_json(_reports / "test_predictions_aspect_before.json")
+after_preds = load_json(_reports / "test_predictions_aspect_after.json")
+
+
+def cross_aspect_overlap_rate(predictions: list[dict]) -> float:
+    """% of samples with >=1 pair of aspects whose predicted spans overlap."""
+    flagged = 0
+    for sample in predictions:
+        spans = {
+            a: sample["per_aspect"][a].get("span_token")
+            for a in ASPECTS
+            if sample["per_aspect"][a].get("span_token") is not None
+        }
+        overlapping = False
+        for a1, a2 in combinations(spans, 2):
+            if token_span_to_set(spans[a1]) & token_span_to_set(spans[a2]):
+                overlapping = True
+                break
+        flagged += int(overlapping)
+    return flagged / max(len(predictions), 1)
+
+
+print(f"{'Aspect':<20}{'F1 before':>12}{'F1 after':>12}{'EM before':>12}{'EM after':>12}")
+for aspect in ASPECTS:
+    b = before["span_metrics"][aspect]
+    a = after["span_metrics"][aspect]
+    print(
+        f"{aspect:<20}{b['f1']:>12.4f}{a['f1']:>12.4f}"
+        f"{b['exact_match']:>12.4f}{a['exact_match']:>12.4f}"
+    )
+
+print()
+print("Cross-aspect evidence overlap rate:")
+print("  before:", f"{cross_aspect_overlap_rate(before_preds):.4f}")
+print("  after: ", f"{cross_aspect_overlap_rate(after_preds):.4f}")
+```
+
+سپس دو مثال گزارش‌شدهٔ اصلی (لپ‌تاپ ارزون/روزمره، و لپ‌تاپ بی‌خرابی/مقرون‌به‌صرفه) را دستی با `ask(...)` (قدم ۹) دوباره تست کن تا مطمئن شوی `cost_effectiveness`/`durability` دیگر evidence اشتباه از aspectهای دیگر نمی‌گیرند.
+
+---
+
+## فقط inference (بدون آموزش)
+
+اگر مدل را روی Drive گذاشته‌ای و فقط می‌خواهی `ask("...")` بزنی، راهنمای جدا را ببین:
+
+**[COLAB-RUN.md](COLAB-RUN.md)** — لود از `/content/drive/MyDrive/ABPSEES/model_bundle.zip`
+
+---
+
 ## خلاصه سریع — همهٔ سل‌های Colab (از صفر تا ذخیره مدل)
 
 > قبل از اجرا: **Runtime → T4 GPU** و Secret **`HF_TOKEN`** را تنظیم کن.
@@ -525,6 +710,54 @@ DRIVE_DIR = Path("/content/drive/MyDrive/ABPSEES")
 DRIVE_DIR.mkdir(parents=True, exist_ok=True)
 shutil.copy(BUNDLE, DRIVE_DIR / "model_bundle.zip")
 print("Saved to:", DRIVE_DIR / "model_bundle.zip")
+```
+
+**سل ۵ — لود مدل از `outputs` و تعریف `ask(text)`**
+
+> متن را داخل گیومه بنویس. از نام `run` استفاده نکن (با `%run` در Colab قاطی می‌شود).
+
+```python
+from pathlib import Path
+
+from project.bundle import load_model_bundle
+from project.inference import predict, pretty_print_prediction
+
+OUTPUTS = Path("/content/ABPSEES/outputs")
+BUNDLE = OUTPUTS / "model_bundle.zip"
+CHECKPOINT = OUTPUTS / "checkpoints" / "best"
+
+if BUNDLE.exists():
+    _model, _tokenizer, _config = load_model_bundle(BUNDLE)
+    print("Loaded:", BUNDLE)
+elif CHECKPOINT.exists():
+    from project.config import load_config
+    from project.hybrid_model import load_hybrid_model_for_inference
+
+    _config = load_config()
+    _model, _tokenizer = load_hybrid_model_for_inference(_config, str(CHECKPOINT))
+    print("Loaded:", CHECKPOINT)
+else:
+    raise FileNotFoundError(
+        "خروجی مدل در outputs پیدا نشد. اول سل ۳ (train_model) را اجرا کن."
+    )
+
+
+def ask(text: str) -> dict:
+    """متن کاربر را می‌گیرد، پیش‌بینی می‌کند و JSON مرتب چاپ می‌کند."""
+    result = predict(text, _config, model=_model, tokenizer=_tokenizer)
+    print(pretty_print_prediction(result))
+    for warning in result.get("_warnings", []):
+        print("[warning]", warning)
+    return result
+
+
+ask("من دانشجوی مهندسی کامپیوتر هستم و هر روز لپ‌تاپم را به دانشگاه می‌برم.")
+```
+
+بعد فقط صدا بزن (با گیومه):
+
+```python
+ask("من یه لپ‌تاپ می‌خوام که ارزون و قیمت مناسب باشه. هر روز باید با خودم ببرمش محل کار.")
 ```
 
 بعد از دانلود، روی لپ‌تاپ:
