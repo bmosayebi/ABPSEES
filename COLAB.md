@@ -410,6 +410,7 @@ print(pretty_print_prediction(result))
 | `model_bundle.zip` پیدا نشد | اول `train_model(config)` را تمام کن؛ فایل در `outputs/model_bundle.zip` است |
 | inference لوکال خیلی کند / RAM کم | مدل ۳B روی CPU سنگین است؛ GPU محلی یا همان Colab را برای inference استفاده کن |
 | `NameError: name '__file__' is not defined` | `colab_bootstrap.py` را آپدیت کن (یا دوباره `git clone` / `git pull` بزن) سپس سل bootstrap را دوباره اجرا کن |
+| `Some tensors share memory` / `lm_head.weight` + `embed_tokens.weight` | با نسخهٔ جدید `AspectGuidedTrainer._save` رفع شده؛ `git pull` بزن و آموزش را از اول یا از آخرین checkpoint معتبر ادامه بده |
 | `bitsandbytes` error | `!pip install -q bitsandbytes` را دوباره اجرا کن |
 
 ### ادامه آموزش از checkpoint

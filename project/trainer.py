@@ -48,6 +48,15 @@ class AspectGuidedTrainer(Trainer):
     3. Combines everything via :func:`project.losses.compute_total_loss`
        using the ``lambda_*`` weights from ``aspect_config``.
 
+    Checkpointing (``_save`` / ``_load_best_model``) deliberately bypasses
+    the default ``Trainer`` path that would dump the full
+    ``AspectGuidedModel.state_dict()`` through safetensors. That fails on
+    Qwen (and other tied-embedding LMs) because ``lm_head.weight`` and
+    ``embed_tokens.weight`` share memory. Instead we persist only the
+    LoRA adapter via PEFT ``save_pretrained`` plus the small
+    ``aspect_heads.pt`` file -- the same layout as the final ``best/``
+    directory.
+
     The last computed loss breakdown is kept on
     ``self.last_loss_components`` for logging/inspection (e.g. from a
     notebook or a custom callback).
@@ -98,6 +107,78 @@ class AspectGuidedTrainer(Trainer):
                 if key != "total_loss":
                     logs.setdefault(key, value)
         super().log(logs, *args, **kwargs)
+
+    def _unwrap_aspect_model(self) -> Any:
+        """Return the underlying ``AspectGuidedModel`` (unwrap DDP if needed)."""
+        model = self.model
+        # Prefer the object that already looks like AspectGuidedModel.
+        if hasattr(model, "base_model") and hasattr(model, "aspect_heads"):
+            return model
+        inner = getattr(model, "module", None)
+        if inner is not None and hasattr(inner, "base_model"):
+            return inner
+        return model
+
+    def _save(self, output_dir: str | None = None, state_dict: Any = None) -> None:
+        """Save LoRA adapter + aspect heads (never the full tied-weight state_dict).
+
+        Args:
+            output_dir: Checkpoint directory. Defaults to ``args.output_dir``.
+            state_dict: Ignored — kept for Trainer API compatibility. The
+                full hybrid ``state_dict`` must not be written via safetensors
+                because Qwen ties ``lm_head`` and ``embed_tokens``.
+        """
+        import torch
+        from transformers.trainer import TRAINING_ARGS_NAME
+
+        from project.hybrid_model import save_aspect_heads
+
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+        model = self._unwrap_aspect_model()
+        # PEFT saves only adapter weights (+ adapter_config.json), not the
+        # frozen 4-bit base — and correctly handles tied embeddings.
+        model.base_model.save_pretrained(output_dir)
+        save_aspect_heads(
+            model, Path(output_dir) / self.aspect_config.heads_checkpoint_name
+        )
+
+        tokenizer = getattr(self, "tokenizer", None) or getattr(self, "processing_class", None)
+        if tokenizer is not None and hasattr(tokenizer, "save_pretrained"):
+            tokenizer.save_pretrained(output_dir)
+
+        torch.save(self.args, str(Path(output_dir) / TRAINING_ARGS_NAME))
+        logger.info(
+            "Saved aspect-guided checkpoint (LoRA adapter + aspect heads) to %s",
+            output_dir,
+        )
+
+    def _load_best_model(self) -> None:
+        """Reload the best LoRA adapter + aspect heads after training ends."""
+        from peft.utils import load_peft_weights, set_peft_model_state_dict
+
+        from project.hybrid_model import load_aspect_heads
+
+        if self.state.best_model_checkpoint is None:
+            logger.warning("No best model checkpoint found; skipping load_best_model.")
+            return
+
+        best_path = self.state.best_model_checkpoint
+        model = self._unwrap_aspect_model()
+        logger.info("Loading best aspect-guided checkpoint from %s", best_path)
+
+        adapter_weights = load_peft_weights(best_path)
+        set_peft_model_state_dict(model.base_model, adapter_weights)
+
+        heads_path = Path(best_path) / self.aspect_config.heads_checkpoint_name
+        if heads_path.exists():
+            load_aspect_heads(model, heads_path)
+        else:
+            logger.warning(
+                "Best checkpoint has no aspect heads at %s; keeping current heads.",
+                heads_path,
+            )
 
 
 def build_training_arguments(
@@ -290,7 +371,7 @@ def train_model(
     resume_from_checkpoint: str | Path | None = None,
 ) -> Trainer:
     """Run fine-tuning and save the best adapter (+ aspect heads, if enabled)."""
-    trainer, model, _ = build_trainer(config, resume_from_checkpoint)
+    trainer, _, _ = build_trainer(config, resume_from_checkpoint)
     ckpt = str(resume_from_checkpoint) if resume_from_checkpoint else None
     if ckpt is None:
         latest = find_latest_checkpoint(config.paths.checkpoint_dir)
@@ -303,18 +384,11 @@ def train_model(
     best_dir.mkdir(parents=True, exist_ok=True)
 
     if config.aspect.enabled:
-        # `model` is an AspectGuidedModel, not a PreTrainedModel/PeftModel,
-        # so generic `trainer.save_model()` would fall back to dumping a
-        # single raw `state_dict()` (base + LoRA + aspect heads combined,
-        # including the frozen 4-bit base weights) instead of the canonical
-        # `adapter_model.safetensors` + `adapter_config.json` LoRA layout.
-        # Save the inner PEFT model and the aspect heads separately instead,
-        # exactly mirroring the non-aspect path's adapter-only output.
-        from project.hybrid_model import save_aspect_heads
-
-        model.base_model.save_pretrained(str(best_dir))
-        heads_path = best_dir / config.aspect.heads_checkpoint_name
-        save_aspect_heads(model, heads_path)
+        # Use the same LoRA-adapter + aspect-heads layout as mid-training
+        # checkpoints (AspectGuidedTrainer._save). Do NOT call
+        # trainer.save_model() here — that would dump the full hybrid
+        # state_dict and crash on Qwen's tied lm_head/embed_tokens weights.
+        trainer._save(str(best_dir))
         logger.info("Saved best adapter + aspect heads to %s", best_dir)
     else:
         trainer.save_model(str(best_dir))
