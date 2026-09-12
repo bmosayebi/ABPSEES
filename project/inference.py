@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from project.config import AppConfig
+from project.constants import ASPECTS
 from project.evaluation import generate_prediction
 from project.losses import check_faithfulness_consistency
 from project.metrics import normalize_parsed_labels, parse_model_output
@@ -62,12 +63,18 @@ def predict(
         tokenizer: Optional pre-loaded tokenizer.
 
     Returns:
-        Dict with ``labels`` key and optional ``_warnings``.
+        Dict with ``labels`` key and optional ``_warnings`` and (when
+        ``config.aspect.enabled``) ``_aspect_attention`` diagnostics.
     """
     if model is None or tokenizer is None:
         if adapter_path is None:
             adapter_path = config.paths.checkpoint_dir / "best"
-        model, tokenizer = load_model_for_inference(config, str(adapter_path))
+        if config.aspect.enabled:
+            from project.hybrid_model import load_hybrid_model_for_inference
+
+            model, tokenizer = load_hybrid_model_for_inference(config, str(adapter_path))
+        else:
+            model, tokenizer = load_model_for_inference(config, str(adapter_path))
 
     raw = generate_prediction(model, tokenizer, text, config)
     parsed, error = parse_model_output(raw)
@@ -76,6 +83,29 @@ def predict(
     result: dict[str, Any] = {"labels": labels, "raw_output": raw}
     if parsed is None:
         result["_warnings"] = [f"JSON parse error: {error}"]
+
+    if config.aspect.enabled and hasattr(model, "aspect_heads"):
+        try:
+            from project.hybrid_model import run_aspect_heads_on_text
+
+            diagnostics = run_aspect_heads_on_text(model, tokenizer, text, config)
+            result["_aspect_attention"] = diagnostics["per_aspect"]
+
+            # Repair/override the generated JSON's evidence with the
+            # span-head's decoded substring whenever it is invalid (empty
+            # while the score suggests otherwise, or not a real substring
+            # of the input) or whenever `aspect.prefer_span_evidence` opts
+            # into always trusting the extractive span head.
+            for aspect in ASPECTS:
+                entry = diagnostics["per_aspect"][aspect]
+                current_evidence = labels[aspect]["evidence"]
+                current_valid = current_evidence == "" or current_evidence in text
+                if config.aspect.prefer_span_evidence or not current_valid:
+                    labels[aspect]["evidence"] = entry["span_evidence"]
+        except Exception:
+            logger.exception(
+                "Aspect head diagnostics failed; continuing with generative-only prediction."
+            )
 
     if config.inference.faithfulness_warn:
         warnings = validate_evidence_in_text(
@@ -120,5 +150,10 @@ def predict_batch(
     """
     if adapter_path is None:
         adapter_path = config.paths.checkpoint_dir / "best"
-    model, tokenizer = load_model_for_inference(config, str(adapter_path))
+    if config.aspect.enabled:
+        from project.hybrid_model import load_hybrid_model_for_inference
+
+        model, tokenizer = load_hybrid_model_for_inference(config, str(adapter_path))
+    else:
+        model, tokenizer = load_model_for_inference(config, str(adapter_path))
     return [predict(t, config, model=model, tokenizer=tokenizer) for t in texts]

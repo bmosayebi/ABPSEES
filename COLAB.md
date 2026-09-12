@@ -179,6 +179,7 @@ paths:
 | 05 | `05_evaluation.ipynb` | ارزیابی |
 | 06 | `06_inference.ipynb` | پیش‌بینی |
 | 07 | `07_error_analysis.ipynb` | تحلیل خطا |
+| 08 | `08_aspect_attention.ipynb` | Aspect-Guided Attention (دمو + ablation) |
 
 ### آپلود نوت‌بوک‌ها در Colab
 
@@ -303,6 +304,23 @@ trainer = train_model(
 | gradient_accumulation | 4 |
 | fp16 | فعال |
 | LoRA rank | 16 |
+
+---
+
+## قدم ۱۰ — Aspect-Guided Attention (اختیاری)
+
+اگر در `config/colab.yaml` مقدار `aspect.enabled: true` باشد (پیش‌فرض)،
+مدل علاوه بر خروجی JSON، هدهای کمکی attention/امتیاز/evidence هم دارد.
+راهنمای کامل علمی: **[docs/ASPECT_ATTENTION_GUIDE.md](docs/ASPECT_ATTENTION_GUIDE.md)**.
+دمو و ablation در `08_aspect_attention.ipynb`.
+
+```python
+from project.hybrid_model import load_hybrid_model_for_inference, run_aspect_heads_on_text
+
+hybrid_model, tokenizer = load_hybrid_model_for_inference(config)
+diag = run_aspect_heads_on_text(hybrid_model, tokenizer, text, config)
+print(diag["per_aspect"])
+```
 
 ---
 

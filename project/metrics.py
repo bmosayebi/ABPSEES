@@ -281,6 +281,109 @@ def compute_all_score_metrics(
     return results
 
 
+def compute_score_metrics_from_arrays(
+    y_true_by_aspect: dict[str, list[float]],
+    y_pred_by_aspect: dict[str, list[float]],
+) -> dict[str, dict[str, float]]:
+    """Per-aspect + overall score metrics from raw score lists.
+
+    Like :func:`compute_all_score_metrics`, but for predictions that don't
+    come from parsed generative JSON (e.g. the aspect-head regression
+    output), which are naturally collected as flat per-aspect lists rather
+    than full ``sample``/``labels`` dicts.
+
+    Args:
+        y_true_by_aspect: Mapping ``aspect -> list of ground-truth scores``.
+        y_pred_by_aspect: Mapping ``aspect -> list of predicted scores``.
+
+    Returns:
+        Per-aspect and ``overall`` (macro-averaged) score metrics.
+    """
+    results: dict[str, dict[str, float]] = {}
+    for aspect in ASPECTS:
+        y_true = np.array(y_true_by_aspect[aspect], dtype=float)
+        y_pred = np.array(y_pred_by_aspect[aspect], dtype=float)
+        results[aspect] = compute_score_metrics(y_true, y_pred)
+
+    keys = ["mae", "rmse", "pearson", "spearman"]
+    results["overall"] = {
+        k: float(np.mean([results[a][k] for a in ASPECTS if not np.isnan(results[a][k])]))
+        for k in keys
+    }
+    return results
+
+
+def compute_head_span_metrics(
+    gold_token_spans: list[dict[str, tuple[int, int]]],
+    pred_token_spans: list[dict[str, tuple[int, int] | None]],
+) -> dict[str, dict[str, float]]:
+    """Per-aspect + overall token F1/EM for aspect-head span predictions.
+
+    Args:
+        gold_token_spans: Per-sample mapping ``aspect -> gold inclusive
+            token span`` (``INVALID_TOKEN_SPAN`` when there is no evidence),
+            aligned to the same tokenization as ``pred_token_spans``.
+        pred_token_spans: Per-sample mapping ``aspect -> predicted inclusive
+            token span, or ``None`` when the has-evidence gate abstained.
+
+    Returns:
+        Output of :func:`aggregate_evidence_metrics` over the head-based
+        predictions.
+    """
+    per_sample: list[dict[str, dict[str, float]]] = []
+    for gold, pred in zip(gold_token_spans, pred_token_spans):
+        sample_metrics: dict[str, dict[str, float]] = {}
+        for aspect in ASPECTS:
+            gold_set = token_span_to_set(gold.get(aspect, INVALID_TOKEN_SPAN))
+            pred_span = pred.get(aspect)
+            pred_set = token_span_to_set(pred_span) if pred_span is not None else set()
+            sample_metrics[aspect] = compute_token_f1(pred_set, gold_set)
+        per_sample.append(sample_metrics)
+    return aggregate_evidence_metrics(per_sample)
+
+
+def compute_faithfulness_rates(
+    per_aspect_scores: dict[str, list[float]],
+    per_aspect_has_evidence_prob: dict[str, list[float]],
+    low_threshold: float,
+    high_threshold: float,
+    decode_threshold: float = 0.5,
+) -> dict[str, dict[str, float]]:
+    """Rates of the two faithfulness failure modes the Phase 2 loss targets.
+
+    Args:
+        per_aspect_scores: Mapping ``aspect -> list of predicted scores``.
+        per_aspect_has_evidence_prob: Mapping ``aspect -> list of
+            sigmoid(has_evidence_logit)`` values.
+        low_threshold: ``AspectConfig.low_score_threshold``.
+        high_threshold: ``AspectConfig.high_score_threshold``.
+        decode_threshold: Probability threshold for "has evidence".
+
+    Returns:
+        Per-aspect + ``overall`` dict with ``high_score_empty_evidence_rate``
+        and ``low_score_nonempty_evidence_rate``.
+    """
+    results: dict[str, dict[str, float]] = {}
+    for aspect in ASPECTS:
+        scores = np.array(per_aspect_scores[aspect], dtype=float)
+        probs = np.array(per_aspect_has_evidence_prob[aspect], dtype=float)
+        has_evidence = probs >= decode_threshold
+        if len(scores) == 0:
+            results[aspect] = {
+                "high_score_empty_evidence_rate": float("nan"),
+                "low_score_nonempty_evidence_rate": float("nan"),
+            }
+            continue
+        results[aspect] = {
+            "high_score_empty_evidence_rate": float(np.mean((scores > high_threshold) & (~has_evidence))),
+            "low_score_nonempty_evidence_rate": float(np.mean((scores < low_threshold) & has_evidence)),
+        }
+
+    keys = ["high_score_empty_evidence_rate", "low_score_nonempty_evidence_rate"]
+    results["overall"] = {k: float(np.mean([results[a][k] for a in ASPECTS])) for k in keys}
+    return results
+
+
 def evidence_validity_rate(
     texts: list[str],
     pred_labels_list: list[dict[str, Any]],

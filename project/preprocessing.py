@@ -52,6 +52,45 @@ def find_evidence_char_span(text: str, evidence: str) -> tuple[int, int]:
     return start, start + len(evidence)
 
 
+def map_char_span_to_tokens(
+    offsets: list[tuple[int, int]],
+    char_span: tuple[int, int],
+) -> tuple[int, int]:
+    """Map a character span to inclusive token indices given an offset mapping.
+
+    Pure function (no tokenizer call) so it can be reused against offsets
+    produced from tokenizing a *larger enclosing string* -- e.g. mapping an
+    evidence span, originally located within the raw user text, onto the
+    tokenization of the full chat-formatted training sequence (see
+    :func:`build_aspect_sequence_features`).
+
+    Args:
+        offsets: Per-token ``(start_char, end_char)`` offsets (end exclusive)
+            as returned by a fast tokenizer's ``return_offsets_mapping``.
+        char_span: ``(start_char, end_char)`` with end exclusive, in the
+            same coordinate system as ``offsets``.
+
+    Returns:
+        ``(start_tok, end_tok)`` inclusive token indices, or ``(-1, -1)`` if
+        ``char_span`` is the empty-evidence sentinel or no token overlaps it.
+    """
+    if char_span == INVALID_CHAR_SPAN:
+        return INVALID_TOKEN_SPAN
+
+    start_char, end_char = char_span
+    token_indices: list[int] = []
+    for idx, (tok_start, tok_end) in enumerate(offsets):
+        if tok_end <= start_char:
+            continue
+        if tok_start >= end_char:
+            break
+        token_indices.append(idx)
+
+    if not token_indices:
+        return INVALID_TOKEN_SPAN
+    return token_indices[0], token_indices[-1]
+
+
 def char_span_to_token_span(
     text: str,
     char_span: tuple[int, int],
@@ -70,7 +109,6 @@ def char_span_to_token_span(
     if char_span == INVALID_CHAR_SPAN:
         return INVALID_TOKEN_SPAN
 
-    start_char, end_char = char_span
     encoding = tokenizer(
         text,
         return_offsets_mapping=True,
@@ -80,19 +118,72 @@ def char_span_to_token_span(
     if not offsets:
         return INVALID_TOKEN_SPAN
 
-    token_indices: list[int] = []
-    for idx, (tok_start, tok_end) in enumerate(offsets):
-        if tok_end <= start_char:
-            continue
-        if tok_start >= end_char:
-            break
-        token_indices.append(idx)
-
-    if not token_indices:
+    token_span = map_char_span_to_tokens(offsets, char_span)
+    if token_span == INVALID_TOKEN_SPAN:
         raise ValueError(
             f"Could not map char span {char_span} to tokens for text snippet: {text[:80]!r}"
         )
-    return token_indices[0], token_indices[-1]
+    return token_span
+
+
+def locate_user_text_offset(prompt: str, user_text: str) -> int:
+    """Find the character offset of the raw user text within a chat prompt.
+
+    The Qwen chat template renders message contents verbatim, so the raw
+    user ``text`` appears as a contiguous substring of the full prompt
+    (inside the ``متن کاربر:\\n{text}`` user turn). We search *after* the
+    ``USER_PROMPT_TEMPLATE`` marker so a coincidental match inside the fixed
+    system prompt can never be selected.
+
+    Args:
+        prompt: Full chat-formatted prompt (or training sequence) string.
+        user_text: Raw Persian input text.
+
+    Returns:
+        Character offset of ``user_text`` within ``prompt``.
+
+    Raises:
+        ValueError: If ``user_text`` cannot be located in ``prompt``.
+    """
+    from project.prompts import USER_PROMPT_TEMPLATE
+
+    marker = USER_PROMPT_TEMPLATE.split("{text}")[0]
+    marker_idx = prompt.find(marker)
+    search_start = marker_idx + len(marker) if marker_idx != -1 else 0
+    offset = prompt.find(user_text, search_start)
+    if offset == -1:
+        raise ValueError("Could not locate user text within the chat-formatted prompt.")
+    return offset
+
+
+def build_user_token_mask(
+    offsets: list[tuple[int, int]],
+    text_char_start: int,
+    text_char_end: int,
+) -> list[int]:
+    """Build a binary token mask marking tokens that fall within a char range.
+
+    Used to restrict aspect-conditioned attention to the raw user-text
+    tokens, excluding the system prompt, chat-template markers, the
+    assistant's JSON completion, and special/padding tokens (which have the
+    degenerate ``(0, 0)`` offset for fast tokenizers).
+
+    Args:
+        offsets: Per-token ``(start_char, end_char)`` offsets.
+        text_char_start: Inclusive character start of the target range.
+        text_char_end: Exclusive character end of the target range.
+
+    Returns:
+        List of ``0``/``1`` ints, one per token in ``offsets``.
+    """
+    mask: list[int] = []
+    for tok_start, tok_end in offsets:
+        if tok_start == 0 and tok_end == 0:
+            mask.append(0)
+            continue
+        overlaps = tok_end > text_char_start and tok_start < text_char_end
+        mask.append(1 if overlaps else 0)
+    return mask
 
 
 def validate_and_enrich_sample(
@@ -231,6 +322,134 @@ def build_sft_dataset(
     return [build_sft_record(sample, tokenizer) for sample in samples]
 
 
+def build_aspect_sft_example(
+    sample: dict[str, Any],
+    tokenizer: Any,
+    max_seq_length: int,
+) -> dict[str, Any]:
+    """Tokenize one enriched sample into full aspect-aware training features.
+
+    Produces everything :class:`AspectAwareCollator` needs to batch: the
+    standard causal-LM ``input_ids``/``attention_mask``/``labels`` (labels
+    are left un-masked here; prompt-masking happens at collate time, exactly
+    like :class:`CompletionOnlyCollator`), plus ``user_token_mask``,
+    ``aspect_scores``, ``aspect_has_evidence``, ``aspect_start``, and
+    ``aspect_end`` -- all aligned to the *full* chat-formatted sequence.
+
+    The evidence ``char_span``/``token_span`` stored on
+    ``sample["labels"][aspect]`` by :func:`validate_and_enrich_sample` are
+    relative to the raw ``text`` alone (tokenized without the chat
+    template). This function re-locates ``text`` inside the full rendered
+    training sequence and re-maps each ``char_span`` onto that sequence's
+    token offsets, so the resulting ``aspect_start``/``aspect_end`` indices
+    are valid positions into the *same* ``input_ids`` used for the causal-LM
+    loss.
+
+    Args:
+        sample: Enriched sample (``text``, ``labels`` with ``char_span``).
+        tokenizer: HuggingFace tokenizer with a chat template.
+        max_seq_length: Maximum sequence length (truncation).
+
+    Returns:
+        Dict with ``input_ids``, ``attention_mask``, ``labels``,
+        ``user_token_mask`` (all ``list[int]``, length ``T``), and
+        ``aspect_scores`` (``list[float]``, length ``len(ASPECTS)``),
+        ``aspect_has_evidence`` (``list[int]``), ``aspect_start``,
+        ``aspect_end`` (``list[int]``, ``-100`` sentinel where there is no
+        evidence, it was truncated away, or the user text could not be
+        re-located).
+    """
+    text = sample["text"]
+    messages = build_chat_messages(text, labels=sample["labels"])
+    full_text = tokenizer.apply_chat_template(messages, tokenize=False)
+
+    encoding = tokenizer(
+        full_text,
+        truncation=True,
+        max_length=max_seq_length,
+        return_offsets_mapping=True,
+    )
+    input_ids = encoding["input_ids"]
+    attention_mask = encoding["attention_mask"]
+    offsets = encoding["offset_mapping"]
+    seq_len = len(input_ids)
+
+    try:
+        base_offset: int | None = locate_user_text_offset(full_text, text)
+    except ValueError:
+        logger.warning(
+            "Could not locate user text inside training sequence; "
+            "disabling aspect labels for this sample."
+        )
+        base_offset = None
+
+    if base_offset is not None:
+        user_token_mask = build_user_token_mask(offsets, base_offset, base_offset + len(text))
+    else:
+        user_token_mask = [0] * seq_len
+
+    # Truncation can cut the sequence off partway through an evidence span,
+    # in which case ``map_char_span_to_tokens`` would silently return a
+    # *shorter* span covering only the surviving tokens. Detect this by
+    # comparing the evidence's end char offset against the char range
+    # actually covered by the (already truncated) offsets, and treat any
+    # truncated-away evidence as no-evidence rather than teach the model a
+    # mangled partial span.
+    max_covered_char = max((end for _, end in offsets), default=0)
+
+    aspect_scores: list[float] = []
+    aspect_has_evidence: list[int] = []
+    aspect_start: list[int] = []
+    aspect_end: list[int] = []
+
+    for aspect in ASPECTS:
+        label = sample["labels"][aspect]
+        aspect_scores.append(float(label["score"]))
+        char_span = tuple(label.get("char_span", list(INVALID_CHAR_SPAN)))
+
+        start_tok, end_tok = -100, -100
+        has_evidence = 0
+        if base_offset is not None and char_span != INVALID_CHAR_SPAN:
+            full_char_span = (base_offset + char_span[0], base_offset + char_span[1])
+            not_truncated = full_char_span[1] <= max_covered_char
+            tok_span = map_char_span_to_tokens(offsets, full_char_span)
+            if tok_span != INVALID_TOKEN_SPAN and tok_span[1] < seq_len and not_truncated:
+                start_tok, end_tok = tok_span
+                has_evidence = 1
+        aspect_has_evidence.append(has_evidence)
+        aspect_start.append(start_tok)
+        aspect_end.append(end_tok)
+
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": list(input_ids),
+        "user_token_mask": user_token_mask,
+        "aspect_scores": aspect_scores,
+        "aspect_has_evidence": aspect_has_evidence,
+        "aspect_start": aspect_start,
+        "aspect_end": aspect_end,
+    }
+
+
+def build_aspect_sft_dataset(
+    samples: list[dict[str, Any]],
+    tokenizer: Any,
+    max_seq_length: int,
+) -> list[dict[str, Any]]:
+    """Convert enriched samples to aspect-aware tokenized training features.
+
+    Args:
+        samples: Enriched samples.
+        tokenizer: HuggingFace tokenizer.
+        max_seq_length: Maximum sequence length (truncation).
+
+    Returns:
+        List of feature dicts (see :func:`build_aspect_sft_example`).
+    """
+    return [build_aspect_sft_example(sample, tokenizer, max_seq_length) for sample in samples]
+
+
 class CompletionOnlyCollator:
     """Data collator that pads batches and masks prompt tokens for causal LM training."""
 
@@ -300,6 +519,57 @@ class CompletionOnlyCollator:
             if input_ids[i : i + template_len] == self.response_token_ids:
                 return i + template_len
         return None
+
+
+class AspectAwareCollator(CompletionOnlyCollator):
+    """Adds aspect-guided-attention supervision fields on top of the base collator.
+
+    Reuses :class:`CompletionOnlyCollator` verbatim for ``input_ids``,
+    ``attention_mask``, and response-template label masking, then pads
+    ``user_token_mask`` (0-pad, matching ``attention_mask``'s convention)
+    and stacks the fixed-length (``len(ASPECTS)``) ``aspect_scores``,
+    ``aspect_has_evidence``, ``aspect_start``, and ``aspect_end`` fields
+    produced by :func:`build_aspect_sft_example` -- these need no padding
+    since every example already has exactly ``len(ASPECTS)`` entries.
+    """
+
+    def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
+        """Pad/collate base fields, then attach aspect supervision tensors.
+
+        Args:
+            features: List of feature dicts as returned by
+                :func:`build_aspect_sft_example`.
+
+        Returns:
+            Batched tensors: the base collator's keys plus
+            ``user_token_mask``, ``aspect_scores``, ``aspect_has_evidence``,
+            ``aspect_start``, ``aspect_end``.
+        """
+        import torch
+
+        batch = super().__call__(features)
+        max_len = batch["input_ids"].shape[1]
+
+        user_mask_batch: list[list[int]] = []
+        for feature in features:
+            mask = list(feature["user_token_mask"])
+            pad_len = max_len - len(mask)
+            user_mask_batch.append(mask + [0] * pad_len)
+
+        batch["user_token_mask"] = torch.tensor(user_mask_batch, dtype=torch.long)
+        batch["aspect_scores"] = torch.tensor(
+            [feature["aspect_scores"] for feature in features], dtype=torch.float
+        )
+        batch["aspect_has_evidence"] = torch.tensor(
+            [feature["aspect_has_evidence"] for feature in features], dtype=torch.long
+        )
+        batch["aspect_start"] = torch.tensor(
+            [feature["aspect_start"] for feature in features], dtype=torch.long
+        )
+        batch["aspect_end"] = torch.tensor(
+            [feature["aspect_end"] for feature in features], dtype=torch.long
+        )
+        return batch
 
 
 def tokenize_sft_example(

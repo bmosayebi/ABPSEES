@@ -148,6 +148,29 @@ class ColabConfig:
 
 
 @dataclass
+class AspectConfig:
+    """Aspect-guided attention (Phase 1 + Phase 2) hyperparameters.
+
+    Controls the auxiliary hybrid module that attaches aspect-conditioned
+    attention, score-regression heads, and span-extraction heads on top of
+    the Qwen hidden states, in addition to the primary generative JSON path.
+    """
+
+    enabled: bool
+    hidden_layer: int
+    attn_dropout: float
+    score_hidden: int
+    lambda_ce: float
+    lambda_score: float
+    lambda_span: float
+    lambda_faith: float
+    low_score_threshold: float
+    high_score_threshold: float
+    prefer_span_evidence: bool
+    heads_checkpoint_name: str
+
+
+@dataclass
 class AppConfig:
     """Top-level application configuration."""
 
@@ -161,6 +184,7 @@ class AppConfig:
     data: DataConfig
     inference: InferenceConfig
     colab: ColabConfig
+    aspect: AspectConfig
     project_root: Path = field(default_factory=get_project_root)
 
     def resolve_path(self, path: Path) -> Path:
@@ -202,6 +226,52 @@ def _parse_colab_config(raw: dict[str, Any] | None) -> ColabConfig:
         drive_project_path=str(merged["drive_project_path"]),
         hf_token_env=str(merged["hf_token_env"]),
         use_colab_secrets=bool(merged["use_colab_secrets"]),
+    )
+
+
+def _default_aspect_config() -> dict[str, Any]:
+    """Default values for the aspect-guided attention module."""
+    return {
+        "enabled": False,
+        "hidden_layer": -1,
+        "attn_dropout": 0.1,
+        "score_hidden": 256,
+        "lambda_ce": 1.0,
+        "lambda_score": 0.5,
+        "lambda_span": 0.5,
+        "lambda_faith": 0.1,
+        "low_score_threshold": 0.25,
+        "high_score_threshold": 0.5,
+        "prefer_span_evidence": False,
+        "heads_checkpoint_name": "aspect_heads.pt",
+    }
+
+
+def _parse_aspect_config(raw: dict[str, Any] | None) -> AspectConfig:
+    """Build AspectConfig with sensible defaults, validating thresholds."""
+    merged = {**_default_aspect_config(), **(raw or {})}
+
+    low = float(merged["low_score_threshold"])
+    high = float(merged["high_score_threshold"])
+    if not 0.0 <= low < high <= 1.0:
+        raise ValueError(
+            "aspect.low_score_threshold must be < aspect.high_score_threshold, "
+            f"both in [0, 1], got low={low}, high={high}"
+        )
+
+    return AspectConfig(
+        enabled=bool(merged["enabled"]),
+        hidden_layer=int(merged["hidden_layer"]),
+        attn_dropout=float(merged["attn_dropout"]),
+        score_hidden=int(merged["score_hidden"]),
+        lambda_ce=float(merged["lambda_ce"]),
+        lambda_score=float(merged["lambda_score"]),
+        lambda_span=float(merged["lambda_span"]),
+        lambda_faith=float(merged["lambda_faith"]),
+        low_score_threshold=low,
+        high_score_threshold=high,
+        prefer_span_evidence=bool(merged["prefer_span_evidence"]),
+        heads_checkpoint_name=str(merged["heads_checkpoint_name"]),
     )
 
 
@@ -281,6 +351,7 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
         data=DataConfig(**data_cfg),
         inference=InferenceConfig(**raw["inference"]),
         colab=_parse_colab_config(raw.get("colab")),
+        aspect=_parse_aspect_config(raw.get("aspect")),
         project_root=root,
     )
 

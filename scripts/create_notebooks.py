@@ -230,10 +230,121 @@ print(pretty_print_prediction(result))
 from project.visualization import generate_all_visualizations
 
 results = run_evaluation(config, split='test')
-paths = generate_all_visualizations(results, config.paths.reports_dir / 'figures')
+paths = generate_all_visualizations(
+    results, config.paths.reports_dir / 'figures',
+    aspect_results=results.get('aspect_results'),
+)
 for k, v in paths.items():
     print(k, '->', v)
 """
+            ),
+        ],
+        "08_aspect_attention.ipynb": [
+            md(
+                "# 08 — Aspect-Guided Attention (Phase 1 + Phase 2)\n\n"
+                "Demos and ablations for the auxiliary aspect-conditioned attention "
+                "heads: per-aspect score regression, evidence-span extraction, and "
+                "faithfulness diagnostics. See `docs/ASPECT_ATTENTION_GUIDE.md` for "
+                "the full scientific write-up.\n\n"
+                "**Requires:** `aspect.enabled: true` in the active config, and a "
+                "checkpoint trained with `04_training.ipynb` (which saves "
+                "`aspect_heads.pt` alongside the LoRA adapter when enabled)."
+            ),
+            code(COLAB_SETUP),
+            code(
+                """print('Aspect attention enabled:', config.aspect.enabled)
+print('Hidden layer:', config.aspect.hidden_layer)
+print('Lambdas: ce={} score={} span={} faith={}'.format(
+    config.aspect.lambda_ce, config.aspect.lambda_score,
+    config.aspect.lambda_span, config.aspect.lambda_faith,
+))
+"""
+            ),
+            md(
+                "## Load the hybrid model\n\n"
+                "Loads the base Qwen model + LoRA adapter + the auxiliary "
+                "`AspectHeads` (score/span/has-evidence) from "
+                "`outputs/checkpoints/best/`."
+            ),
+            code(
+                """from project.hybrid_model import load_hybrid_model_for_inference
+
+hybrid_model, tokenizer = load_hybrid_model_for_inference(config)
+print(hybrid_model.aspect_heads)
+"""
+            ),
+            md(
+                "## Single-example demo: score head vs generated JSON\n\n"
+                "Compares the primary generative JSON prediction with the "
+                "auxiliary score/span heads on one Persian example."
+            ),
+            code(
+                """from project.inference import predict, pretty_print_prediction
+
+text = (
+    'من دانشجوی مهندسی کامپیوتر هستم و می خواهم مدل‌های هوش مصنوعی آموزش بدهم. '
+    'هر روز لپ‌تاپم را با خودم به دانشگاه می‌برم.'
+)
+result = predict(text, config, model=hybrid_model, tokenizer=tokenizer)
+print(pretty_print_prediction(result))
+print()
+print('Aspect head diagnostics:')
+for aspect, diag in result.get('_aspect_attention', {}).items():
+    print(f'  {aspect}: score_head={diag[\"score_head\"]:.3f} '
+          f'has_evidence_prob={diag[\"has_evidence_prob\"]:.3f} '
+          f'span_evidence={diag[\"span_evidence\"]!r}')
+"""
+            ),
+            md(
+                "## Attention heatmap for one aspect\n\n"
+                "Visualizes the aspect-conditioned attention distribution "
+                "`alpha_a` over the input tokens, for direct inspection of "
+                "*where* the model is looking when scoring each aspect."
+            ),
+            code(
+                """from project.hybrid_model import run_aspect_heads_on_text
+from project.visualization import plot_aspect_attention_heatmap
+
+diag = run_aspect_heads_on_text(hybrid_model, tokenizer, text, config)
+fig_path = plot_aspect_attention_heatmap(
+    diag['tokens'], diag['attn_weights'],
+    config.paths.reports_dir / 'figures' / 'attention' / 'demo_sample.png',
+)
+print('Saved heatmap to', fig_path)
+"""
+            ),
+            md(
+                "## Full test-set aspect-head evaluation\n\n"
+                "Runs the same head-based evaluation used by "
+                "`run_evaluation` (score MAE/RMSE, span Token F1/EM, "
+                "faithfulness rates) standalone, for ablation experiments."
+            ),
+            code(
+                """from project.evaluation import evaluate_aspect_heads
+from project.dataset import load_split
+from project.preprocessing import save_enriched_split
+
+test_raw = load_split(config, 'test')
+test_enriched = save_enriched_split(test_raw, tokenizer, config, 'test')
+aspect_results = evaluate_aspect_heads(hybrid_model, tokenizer, test_enriched, config)
+
+import pandas as pd
+display(pd.DataFrame(aspect_results['score_metrics']).T)
+display(pd.DataFrame(aspect_results['span_metrics']).T)
+display(pd.DataFrame(aspect_results['faithfulness_rates']).T)
+"""
+            ),
+            md(
+                "## Ablation checklist\n\n"
+                "Suggested runs to compare against the full "
+                "CE + score + span + faith objective (see "
+                "`docs/ASPECT_ATTENTION_GUIDE.md` §7 for details):\n\n"
+                "1. `lambda_score=0, lambda_span=0, lambda_faith=0` (CE-only baseline)\n"
+                "2. `+lambda_score` only (Phase 1)\n"
+                "3. `+lambda_span` (Phase 1 + 2, no faithfulness)\n"
+                "4. Full objective (`+lambda_faith`)\n\n"
+                "Compare `outputs/reports/test_metrics.json` (generative) and "
+                "`outputs/reports/test_metrics_aspect.json` (head-based) across runs."
             ),
         ],
     }

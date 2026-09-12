@@ -82,3 +82,19 @@ colab:
   drive_project_path: /content/drive/MyDrive/ABPSEES
   hf_token_env: HF_TOKEN
   use_colab_secrets: true
+
+# Aspect-guided attention (Phase 1: score heads, Phase 2: span heads + faithfulness).
+# See docs/ASPECT_ATTENTION_GUIDE.md for the full scientific description.
+aspect:
+  enabled: true
+  hidden_layer: -1
+  attn_dropout: 0.1
+  score_hidden: 256
+  lambda_ce: 1.0
+  lambda_score: 0.5
+  lambda_span: 0.5
+  lambda_faith: 0.1
+  low_score_threshold: 0.25
+  high_score_threshold: 0.5
+  prefer_span_evidence: true
+  heads_checkpoint_name: aspect_heads.pt

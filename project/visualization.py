@@ -8,7 +8,7 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 
-from project.constants import ASPECTS, ASPECT_DISPLAY_NAMES
+from project.constants import ASPECTS, ASPECT_DISPLAY_NAMES, INVALID_TOKEN_SPAN
 
 
 def _ensure_dir(path: Path) -> Path:
@@ -252,15 +252,129 @@ def plot_confusion_examples(
     return save_path
 
 
+def plot_aspect_attention_heatmap(
+    tokens: list[str],
+    attn_weights: list[list[float]],
+    save_path: Path,
+    gold_token_spans: dict[str, tuple[int, int]] | None = None,
+) -> Path:
+    """Plot per-aspect attention weight bars over one sample's tokens.
+
+    One subplot per aspect, showing the aspect-conditioned attention
+    distribution ``alpha_a`` (see :mod:`project.aspect_attention`) as a bar
+    chart over token positions, with the ground-truth evidence span (if
+    any) highlighted for direct visual comparison.
+
+    Args:
+        tokens: Decoded token strings, length ``T``.
+        attn_weights: ``[num_aspects, T]`` attention weights.
+        save_path: Output figure path.
+        gold_token_spans: Optional mapping ``aspect -> inclusive gold token
+            span`` to overlay as a shaded region.
+
+    Returns:
+        Path to saved figure.
+    """
+    n = len(ASPECTS)
+    fig, axes = plt.subplots(n, 1, figsize=(max(8.0, len(tokens) * 0.25), 2.2 * n))
+    if n == 1:
+        axes = [axes]
+
+    for i, aspect in enumerate(ASPECTS):
+        ax = axes[i]
+        weights = np.array(attn_weights[i])
+        ax.bar(range(len(tokens)), weights, color="steelblue", width=0.8)
+        if gold_token_spans is not None:
+            span = gold_token_spans.get(aspect, INVALID_TOKEN_SPAN)
+            if tuple(span) != INVALID_TOKEN_SPAN:
+                start, end = span
+                ax.axvspan(start - 0.5, end + 0.5, color="darkorange", alpha=0.25)
+        ax.set_title(ASPECT_DISPLAY_NAMES.get(aspect, aspect), fontsize=9)
+        ax.set_ylabel("attn", fontsize=8)
+        ax.set_xlim(-0.5, max(len(tokens) - 0.5, 0.5))
+        if i == n - 1:
+            ax.set_xticks(range(len(tokens)))
+            ax.set_xticklabels(tokens, rotation=90, fontsize=6)
+        else:
+            ax.set_xticks([])
+
+    fig.suptitle("Aspect-Conditioned Attention (orange = gold evidence span)", fontsize=11)
+    fig.tight_layout()
+    fig.savefig(_ensure_dir(save_path), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return save_path
+
+
+def plot_head_confusion_examples(
+    head_predictions: list[dict[str, Any]],
+    generative_predictions: list[dict[str, Any]],
+    save_path: Path,
+) -> Path:
+    """Identify disagreements between the score/span heads and the generative JSON.
+
+    Args:
+        head_predictions: ``aspect_results["predictions"]`` from
+            :func:`project.evaluation.evaluate_aspect_heads`.
+        generative_predictions: ``results["predictions"]`` from
+            :func:`project.evaluation.evaluate_samples`, in the same sample
+            order.
+        save_path: Output text file path.
+
+    Returns:
+        Path to saved file.
+    """
+    categories: dict[str, list[Any]] = {
+        "head_high_score_no_span": [],
+        "json_vs_head_score_disagreement": [],
+        "json_vs_head_evidence_disagreement": [],
+    }
+
+    for idx, (head_pred, gen_pred) in enumerate(zip(head_predictions, generative_predictions)):
+        for aspect in ASPECTS:
+            head_entry = head_pred["per_aspect"][aspect]
+            gen_entry = gen_pred["pred"][aspect]
+
+            if head_entry["score_head"] > 0.5 and head_entry["has_evidence_prob"] < 0.5:
+                categories["head_high_score_no_span"].append((idx, aspect, round(head_entry["score_head"], 3)))
+
+            gen_score = gen_entry.get("score", float("nan"))
+            if not np.isnan(gen_score) and abs(head_entry["score_head"] - float(gen_score)) > 0.3:
+                categories["json_vs_head_score_disagreement"].append(
+                    (idx, aspect, round(head_entry["score_head"], 3), round(float(gen_score), 3))
+                )
+
+            head_has_evidence = head_entry["span_evidence"] != ""
+            gen_has_evidence = gen_entry.get("evidence", "") != ""
+            if head_has_evidence != gen_has_evidence:
+                categories["json_vs_head_evidence_disagreement"].append(
+                    (idx, aspect, head_entry["span_evidence"], gen_entry.get("evidence", ""))
+                )
+
+    lines = ["# Aspect-Head vs Generative-JSON Confusion Examples", ""]
+    for cat, items in categories.items():
+        lines.append(f"## {cat} ({len(items)} cases)")
+        for item in items[:10]:
+            lines.append(f"- {item}")
+        lines.append("")
+
+    _ensure_dir(save_path).write_text("\n".join(lines), encoding="utf-8")
+    return save_path
+
+
 def generate_all_visualizations(
     results: dict[str, Any],
     figures_dir: Path,
+    aspect_results: dict[str, Any] | None = None,
 ) -> dict[str, Path]:
     """Generate all error analysis outputs.
 
     Args:
         results: Full evaluation results from :func:`run_evaluation`.
         figures_dir: Directory for figures and text reports.
+        aspect_results: Optional aspect-head evaluation results (``results["aspect_results"]``
+            from :func:`project.evaluation.run_evaluation` when
+            ``config.aspect.enabled``). When provided, also generates
+            per-sample attention heatmaps and head-vs-JSON confusion cases.
 
     Returns:
         Mapping of artifact name to file path.
@@ -293,4 +407,21 @@ def generate_all_visualizations(
             gold_samples, pred_labels_list, figures_dir / "confusion_examples.md"
         ),
     }
+
+    if aspect_results is not None and aspect_results.get("predictions"):
+        attn_dir = figures_dir / "attention"
+        head_preds = aspect_results["predictions"]
+        n_examples = min(5, len(head_preds))
+        for i in range(n_examples):
+            pred = head_preds[i]
+            paths[f"attention_heatmap_{i}"] = plot_aspect_attention_heatmap(
+                pred["tokens"],
+                pred["attn_weights"],
+                attn_dir / f"sample_{i}.png",
+                gold_token_spans=pred["gold_token_spans"],
+            )
+        paths["head_confusion"] = plot_head_confusion_examples(
+            head_preds, results["predictions"], figures_dir / "head_confusion_examples.md"
+        )
+
     return paths
