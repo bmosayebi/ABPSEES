@@ -39,7 +39,7 @@ quantization:
   use_double_quant: true
 
 training:
-  num_epochs: 3
+  num_epochs: 5
   per_device_train_batch_size: 2
   per_device_eval_batch_size: 2
   gradient_accumulation_steps: 4
